@@ -4,6 +4,7 @@ mod models;
 mod handlers;
 mod auth;
 mod middleware;
+mod media;
 
 use axum::{middleware as axum_middleware, routing::get, Router};
 use std::sync::Arc;
