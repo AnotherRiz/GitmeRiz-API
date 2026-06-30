@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 # Web framework
-axum = "0.8"
+axum = { version = "0.8", features = ["multipart"] }
 axum-extra = { version = "0.10", features = ["typed-header"] }
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -28,3 +28,5 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Time handling
 chrono = { version = "0.4", features = ["serde"] }
+# UUID generation
+uuid = { version = "1", features = ["v4"] }

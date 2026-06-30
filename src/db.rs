@@ -33,15 +33,17 @@ impl Database {
         .execute(&self.pool)
         .await?;
 
-        // Create gallery table
+        // Create gallery table with file storage columns
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS gallery (
                 id INT AUTO_INCREMENT PRIMARY KEY,
                 user_id INT NOT NULL,
                 title VARCHAR(255) NOT NULL,
-                filename VARCHAR(255) NOT NULL,
-                url TEXT NOT NULL,
+                original_filename VARCHAR(255) NOT NULL,
+                stored_path VARCHAR(512) NOT NULL,
+                size_bytes BIGINT NOT NULL,
+                mime_type VARCHAR(100) NOT NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                 FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
@@ -51,15 +53,17 @@ impl Database {
         .execute(&self.pool)
         .await?;
 
-        // Create videos table
+        // Create videos table with file storage columns
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS videos (
                 id INT AUTO_INCREMENT PRIMARY KEY,
                 user_id INT NOT NULL,
                 title VARCHAR(255) NOT NULL,
-                filename VARCHAR(255) NOT NULL,
-                url TEXT NOT NULL,
+                original_filename VARCHAR(255) NOT NULL,
+                stored_path VARCHAR(512) NOT NULL,
+                size_bytes BIGINT NOT NULL,
+                mime_type VARCHAR(100) NOT NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                 FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
@@ -69,15 +73,17 @@ impl Database {
         .execute(&self.pool)
         .await?;
 
-        // Create audio table
+        // Create audio table with file storage columns
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS audio (
                 id INT AUTO_INCREMENT PRIMARY KEY,
                 user_id INT NOT NULL,
                 title VARCHAR(255) NOT NULL,
-                filename VARCHAR(255) NOT NULL,
-                url TEXT NOT NULL,
+                original_filename VARCHAR(255) NOT NULL,
+                stored_path VARCHAR(512) NOT NULL,
+                size_bytes BIGINT NOT NULL,
+                mime_type VARCHAR(100) NOT NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                 FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
@@ -137,16 +143,6 @@ impl Database {
         )
         .execute(&self.pool)
         .await?;
-
-        // Add role column to existing users table if it doesn't exist
-        let _ = sqlx::query(
-            r#"
-            ALTER TABLE users 
-            ADD COLUMN IF NOT EXISTS role ENUM('superuser', 'admin', 'user') NOT NULL DEFAULT 'user'
-            "#,
-        )
-        .execute(&self.pool)
-        .await;
 
         tracing::info!("Database migrations completed");
         Ok(())
