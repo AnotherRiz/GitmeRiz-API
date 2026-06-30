@@ -3,8 +3,9 @@ mod db;
 mod models;
 mod handlers;
 mod auth;
+mod middleware;
 
-use axum::{routing::get, Router};
+use axum::{middleware as axum_middleware, routing::get, Router};
 use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
@@ -12,10 +13,12 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::config::Config;
 use crate::db::Database;
-use crate::handlers::{health, users};
+use crate::handlers::{health, users, gallery, video, audio, blog, notes, clipboard};
+use crate::middleware::auth_middleware;
 
 pub struct AppState {
     pub db: Database,
+    pub config: Config,
 }
 
 #[tokio::main]
@@ -39,12 +42,25 @@ async fn main() {
     // Run migrations
     db.migrate().await.expect("Failed to run migrations");
 
-    let state = Arc::new(AppState { db });
+    let state = Arc::new(AppState { db, config: config.clone() });
+
+    // Protected routes - require authentication
+    let protected_routes = Router::new()
+        .merge(users::protected_routes())
+        .merge(gallery::router())
+        .merge(video::router())
+        .merge(audio::router())
+        .merge(blog::router())
+        .merge(notes::router())
+        .merge(clipboard::router())
+        .layer(axum_middleware::from_fn_with_state(state.clone(), auth_middleware));
 
     // Build router
     let app = Router::new()
         .route("/health", get(health::health_check))
-        .nest("/api", users::router())
+        .nest("/api", Router::new()
+            .merge(users::public_routes())
+            .merge(protected_routes))
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::new()
             .allow_origin(Any)
