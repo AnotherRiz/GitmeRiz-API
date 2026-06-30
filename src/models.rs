@@ -1,6 +1,44 @@
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 
+// Role enum
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "role", rename_all = "lowercase")]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    Superuser,
+    Admin,
+    User,
+}
+
+impl Role {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Role::Superuser => "superuser",
+            Role::Admin => "admin",
+            Role::User => "user",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "superuser" => Some(Role::Superuser),
+            "admin" => Some(Role::Admin),
+            "user" => Some(Role::User),
+            _ => None,
+        }
+    }
+
+    // Permission checks
+    pub fn can_view_all_media(&self) -> bool {
+        matches!(self, Role::Superuser)
+    }
+
+    pub fn can_write_blog(&self) -> bool {
+        matches!(self, Role::Superuser | Role::Admin)
+    }
+}
+
 // Database model
 #[derive(Debug, FromRow)]
 pub struct User {
@@ -9,15 +47,17 @@ pub struct User {
     pub username: String,
     pub email: String,
     pub password_hash: String,
+    pub role: String,
 }
 
 // Response model (without password)
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct UserResponse {
     pub id: i32,
     pub name: String,
     pub username: String,
     pub email: String,
+    pub role: String,
 }
 
 impl From<User> for UserResponse {
@@ -27,6 +67,7 @@ impl From<User> for UserResponse {
             name: user.name,
             username: user.username,
             email: user.email,
+            role: user.role,
         }
     }
 }
@@ -49,7 +90,41 @@ pub struct LoginRequest {
 #[derive(Debug, Serialize)]
 pub struct LoginResponse {
     pub message: String,
+    pub token: String,
     pub user: UserResponse,
+}
+
+// JWT Claims
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Claims {
+    pub sub: i32,        // user id
+    pub username: String,
+    pub role: String,
+    pub exp: i64,        // expiration time
+    pub iat: i64,        // issued at
+}
+
+// Authenticated user (extracted from JWT)
+#[derive(Debug, Clone)]
+pub struct AuthUser {
+    pub id: i32,
+    #[allow(dead_code)]
+    pub username: String,
+    pub role: Role,
+}
+
+impl AuthUser {
+    pub fn can_view_all_media(&self) -> bool {
+        self.role.can_view_all_media()
+    }
+
+    pub fn can_write_blog(&self) -> bool {
+        self.role.can_write_blog()
+    }
+
+    pub fn is_superuser(&self) -> bool {
+        matches!(self.role, Role::Superuser)
+    }
 }
 
 // Generic API response

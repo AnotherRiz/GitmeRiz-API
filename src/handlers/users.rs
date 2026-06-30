@@ -2,21 +2,28 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
     routing::{get, post},
-    Json, Router,
+    Extension, Json, Router,
 };
 use std::sync::Arc;
 
-use crate::auth::{hash_password, verify_password};
+use crate::auth::{create_token, hash_password, verify_password};
 use crate::models::{
-    ApiResponse, LoginRequest, LoginResponse, RegisterRequest, User, UserResponse,
+    ApiResponse, AuthUser, LoginRequest, LoginResponse, RegisterRequest, User, UserResponse,
 };
 use crate::AppState;
 
-pub fn router() -> Router<Arc<AppState>> {
+// Public routes (no authentication required)
+pub fn public_routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/register", post(register))
         .route("/login", post(login))
+}
+
+// Protected routes (authentication required) - middleware applied in main.rs
+pub fn protected_routes() -> Router<Arc<AppState>> {
+    Router::new()
         .route("/users", get(list_users))
+        .route("/users/me", get(get_current_user))
         .route("/users/{id}", get(get_user).put(update_user).delete(delete_user))
 }
 
@@ -25,6 +32,14 @@ async fn register(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<RegisterRequest>,
 ) -> (StatusCode, Json<ApiResponse<UserResponse>>) {
+    // Validate input
+    if payload.username.trim().is_empty() || payload.email.trim().is_empty() || payload.password.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::error("All fields are required")),
+        );
+    }
+
     // Hash the password
     let password_hash = match hash_password(&payload.password) {
         Ok(hash) => hash,
@@ -36,9 +51,9 @@ async fn register(
         }
     };
 
-    // Insert user into database
+    // Insert user into database with default role 'user'
     let result = sqlx::query(
-        "INSERT INTO users (name, username, email, password_hash) VALUES (?, ?, ?, ?)",
+        "INSERT INTO users (name, username, email, password_hash, role) VALUES (?, ?, ?, ?, 'user')",
     )
     .bind(&payload.name)
     .bind(&payload.username)
@@ -54,6 +69,7 @@ async fn register(
                 name: payload.name,
                 username: payload.username,
                 email: payload.email,
+                role: "user".to_string(),
             };
             (StatusCode::CREATED, Json(ApiResponse::success(user_response)))
         }
@@ -75,7 +91,7 @@ async fn login(
 ) -> (StatusCode, Json<ApiResponse<LoginResponse>>) {
     // Find user by username
     let user: Result<User, _> = sqlx::query_as(
-        "SELECT id, name, username, email, password_hash FROM users WHERE username = ?",
+        "SELECT id, name, username, email, password_hash, role FROM users WHERE username = ?",
     )
     .bind(&payload.username)
     .fetch_one(&state.db.pool)
@@ -86,8 +102,25 @@ async fn login(
             // Verify password
             match verify_password(&payload.password, &user.password_hash) {
                 Ok(true) => {
+                    // Create JWT token
+                    let token = match create_token(
+                        user.id,
+                        &user.username,
+                        &user.role,
+                        &state.config.jwt_secret,
+                    ) {
+                        Ok(t) => t,
+                        Err(_) => {
+                            return (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                Json(ApiResponse::error("Failed to create token")),
+                            );
+                        }
+                    };
+
                     let response = LoginResponse {
                         message: "Login successful".to_string(),
+                        token,
                         user: user.into(),
                     };
                     (StatusCode::OK, Json(ApiResponse::success(response)))
@@ -105,12 +138,41 @@ async fn login(
     }
 }
 
-// GET /api/users
+// GET /api/users/me - Get current authenticated user
+async fn get_current_user(
+    Extension(auth_user): Extension<AuthUser>,
+    State(state): State<Arc<AppState>>,
+) -> (StatusCode, Json<ApiResponse<UserResponse>>) {
+    let user: Result<User, _> = sqlx::query_as(
+        "SELECT id, name, username, email, password_hash, role FROM users WHERE id = ?",
+    )
+    .bind(auth_user.id)
+    .fetch_one(&state.db.pool)
+    .await;
+
+    match user {
+        Ok(user) => (StatusCode::OK, Json(ApiResponse::success(user.into()))),
+        Err(_) => (
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::error("User not found")),
+        ),
+    }
+}
+
+// GET /api/users - List users (superuser only)
 async fn list_users(
+    Extension(auth_user): Extension<AuthUser>,
     State(state): State<Arc<AppState>>,
 ) -> (StatusCode, Json<ApiResponse<Vec<UserResponse>>>) {
+    if !auth_user.is_superuser() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(ApiResponse::error("Only superuser can list all users")),
+        );
+    }
+
     let users: Result<Vec<User>, _> = sqlx::query_as(
-        "SELECT id, name, username, email, password_hash FROM users",
+        "SELECT id, name, username, email, password_hash, role FROM users",
     )
     .fetch_all(&state.db.pool)
     .await;
@@ -129,11 +191,20 @@ async fn list_users(
 
 // GET /api/users/:id
 async fn get_user(
+    Extension(auth_user): Extension<AuthUser>,
     State(state): State<Arc<AppState>>,
     Path(id): Path<i32>,
 ) -> (StatusCode, Json<ApiResponse<UserResponse>>) {
+    // Users can only view their own profile unless they are superuser
+    if auth_user.id != id && !auth_user.is_superuser() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(ApiResponse::error("You can only view your own profile")),
+        );
+    }
+
     let user: Result<User, _> = sqlx::query_as(
-        "SELECT id, name, username, email, password_hash FROM users WHERE id = ?",
+        "SELECT id, name, username, email, password_hash, role FROM users WHERE id = ?",
     )
     .bind(id)
     .fetch_one(&state.db.pool)
@@ -150,10 +221,19 @@ async fn get_user(
 
 // PUT /api/users/:id
 async fn update_user(
+    Extension(auth_user): Extension<AuthUser>,
     State(state): State<Arc<AppState>>,
     Path(id): Path<i32>,
     Json(payload): Json<RegisterRequest>,
 ) -> (StatusCode, Json<ApiResponse<UserResponse>>) {
+    // Users can only update their own profile unless they are superuser
+    if auth_user.id != id && !auth_user.is_superuser() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(ApiResponse::error("You can only update your own profile")),
+        );
+    }
+
     // Hash the new password
     let password_hash = match hash_password(&payload.password) {
         Ok(hash) => hash,
@@ -178,13 +258,27 @@ async fn update_user(
 
     match result {
         Ok(res) if res.rows_affected() > 0 => {
-            let user_response = UserResponse {
-                id,
-                name: payload.name,
-                username: payload.username,
-                email: payload.email,
-            };
-            (StatusCode::OK, Json(ApiResponse::success(user_response)))
+            // Fetch the updated user to get the role
+            let user: Result<User, _> = sqlx::query_as(
+                "SELECT id, name, username, email, password_hash, role FROM users WHERE id = ?",
+            )
+            .bind(id)
+            .fetch_one(&state.db.pool)
+            .await;
+
+            match user {
+                Ok(user) => (StatusCode::OK, Json(ApiResponse::success(user.into()))),
+                Err(_) => {
+                    let user_response = UserResponse {
+                        id,
+                        name: payload.name,
+                        username: payload.username,
+                        email: payload.email,
+                        role: auth_user.role.as_str().to_string(),
+                    };
+                    (StatusCode::OK, Json(ApiResponse::success(user_response)))
+                }
+            }
         }
         Ok(_) => (
             StatusCode::NOT_FOUND,
@@ -199,9 +293,18 @@ async fn update_user(
 
 // DELETE /api/users/:id
 async fn delete_user(
+    Extension(auth_user): Extension<AuthUser>,
     State(state): State<Arc<AppState>>,
     Path(id): Path<i32>,
 ) -> (StatusCode, Json<ApiResponse<String>>) {
+    // Only superuser can delete users
+    if !auth_user.is_superuser() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(ApiResponse::error("Only superuser can delete users")),
+        );
+    }
+
     let result = sqlx::query("DELETE FROM users WHERE id = ?")
         .bind(id)
         .execute(&state.db.pool)
