@@ -60,6 +60,7 @@ impl Database {
                 stored_path VARCHAR(512) NOT NULL,
                 size_bytes BIGINT NOT NULL,
                 mime_type VARCHAR(100) NOT NULL,
+                visibility ENUM('public', 'private') NOT NULL DEFAULT 'private',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                 FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
@@ -68,6 +69,22 @@ impl Database {
         )
         .execute(&self.pool)
         .await?;
+
+        // Check if gallery table is missing 'visibility' column (for existing installations)
+        let has_visibility = match sqlx::query("SHOW COLUMNS FROM gallery LIKE 'visibility'")
+            .fetch_optional(&self.pool)
+            .await
+        {
+            Ok(Some(_)) => true,
+            _ => false,
+        };
+
+        if !has_visibility {
+            tracing::info!("Adding visibility column to gallery table");
+            sqlx::query("ALTER TABLE gallery ADD COLUMN visibility ENUM('public', 'private') NOT NULL DEFAULT 'private'")
+                .execute(&self.pool)
+                .await?;
+        }
 
         // Create videos table with file storage columns
         sqlx::query(
