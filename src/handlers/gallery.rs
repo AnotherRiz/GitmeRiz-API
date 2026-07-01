@@ -3,7 +3,7 @@ use axum::{
     extract::{Multipart, Path, State},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{delete, get, post},
     Extension, Json, Router,
 };
 use serde::Serialize;
@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use crate::media::{
     delete_file, generate_storage_path, read_file, save_file, validate_extension, validate_size,
-    MediaType,
+    get_extension, MediaType,
 };
 use crate::models::{ApiResponse, AuthUser};
 use crate::AppState;
@@ -28,39 +28,45 @@ pub struct GalleryItem {
     pub mime_type: String,
 }
 
-pub fn router() -> Router<Arc<AppState>> {
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+pub enum UploadResponse {
+    Single(GalleryItem),
+    Bulk(Vec<GalleryItem>),
+}
+
+pub fn public_routes() -> Router<Arc<AppState>> {
     Router::new()
-        .route("/gallery", get(list_gallery).post(upload_image))
-        .route("/gallery/{id}", get(get_image).delete(delete_image))
+        .route("/gallery", get(list_gallery))
+        .route("/gallery/{id}", get(get_image))
         .route("/gallery/{id}/download", get(download_image))
 }
 
-// GET /api/gallery - List images (superuser sees all, others see only their own)
+pub fn protected_routes() -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/gallery", post(upload_image))
+        .route("/gallery/{id}", delete(delete_image))
+}
+
+// GET /api/gallery - List all images (public)
 async fn list_gallery(
-    Extension(auth_user): Extension<AuthUser>,
     State(state): State<Arc<AppState>>,
 ) -> (StatusCode, Json<ApiResponse<Vec<GalleryItem>>>) {
-    let items: Result<Vec<GalleryItem>, _> = if auth_user.can_view_all_media() {
-        sqlx::query_as(
-            "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type FROM gallery",
-        )
-        .fetch_all(&state.db.pool)
-        .await
-    } else {
-        sqlx::query_as(
-            "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type FROM gallery WHERE user_id = ?",
-        )
-        .bind(auth_user.id)
-        .fetch_all(&state.db.pool)
-        .await
-    };
+    let items: Result<Vec<GalleryItem>, _> = sqlx::query_as(
+        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type FROM gallery",
+    )
+    .fetch_all(&state.db.pool)
+    .await;
 
     match items {
         Ok(items) => (StatusCode::OK, Json(ApiResponse::success(items))),
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiResponse::error("Failed to fetch gallery items")),
-        ),
+        Err(e) => {
+            tracing::error!("Failed to fetch gallery items: {:?}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::error("Failed to fetch gallery items")),
+            )
+        }
     }
 }
 
@@ -69,10 +75,9 @@ async fn upload_image(
     Extension(auth_user): Extension<AuthUser>,
     State(state): State<Arc<AppState>>,
     mut multipart: Multipart,
-) -> (StatusCode, Json<ApiResponse<GalleryItem>>) {
+) -> (StatusCode, Json<ApiResponse<UploadResponse>>) {
     let mut title: Option<String> = None;
-    let mut file_data: Option<Vec<u8>> = None;
-    let mut original_filename: Option<String> = None;
+    let mut files = Vec::new();
 
     // Parse multipart fields
     while let Ok(Some(field)) = multipart.next_field().await {
@@ -85,112 +90,163 @@ async fn upload_image(
                 }
             }
             "file" => {
-                original_filename = field.file_name().map(|s| s.to_string());
-                if let Ok(bytes) = field.bytes().await {
-                    file_data = Some(bytes.to_vec());
+                let orig_filename = field.file_name().map(|s| s.to_string());
+                if let Some(name) = orig_filename {
+                    if !name.is_empty() {
+                        if let Ok(bytes) = field.bytes().await {
+                            files.push((name, bytes.to_vec()));
+                            if files.len() > 50 {
+                                return (
+                                    StatusCode::BAD_REQUEST,
+                                    Json(ApiResponse::error("Too many files. Limit is 50 files per upload.")),
+                                );
+                            }
+                        }
+                    }
                 }
             }
             _ => {}
         }
     }
 
-    // Validate required fields
-    let file_bytes = match file_data {
-        Some(data) if !data.is_empty() => data,
-        _ => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ApiResponse::error("No file provided")),
-            );
-        }
-    };
+    if files.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::error("No file provided")),
+        );
+    }
 
-    let orig_filename = match original_filename {
-        Some(name) if !name.is_empty() => name,
-        _ => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ApiResponse::error("File must have a filename")),
-            );
-        }
-    };
-
-    let title = title.unwrap_or_else(|| orig_filename.clone());
-
-    // Validate extension
-    let extension = match validate_extension(MediaType::Gallery, &orig_filename) {
-        Ok(ext) => ext,
-        Err(msg) => {
+    // First pass: Validation
+    for (orig_filename, file_bytes) in &files {
+        // Validate extension
+        if let Err(msg) = validate_extension(MediaType::Gallery, orig_filename) {
             return (StatusCode::BAD_REQUEST, Json(ApiResponse::error(msg)));
         }
+
+        // Validate size (100 MB max for images)
+        let size_bytes = file_bytes.len() as u64;
+        if let Err(msg) = validate_size(MediaType::Gallery, size_bytes) {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(ApiResponse::error(msg)),
+            );
+        }
+    }
+
+    let mut uploaded_items = Vec::new();
+    let mut saved_paths: Vec<String> = Vec::new();
+
+    // Start a transaction
+    let mut tx = match state.db.pool.begin().await {
+        Ok(tx) => tx,
+        Err(e) => {
+            tracing::error!("Failed to start transaction: {:?}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::error("Failed to start database transaction")),
+            );
+        }
     };
 
-    // Validate size (100 MB max for images)
-    let size_bytes = file_bytes.len() as u64;
-    if let Err(msg) = validate_size(MediaType::Gallery, size_bytes) {
-        return (
-            StatusCode::PAYLOAD_TOO_LARGE,
-            Json(ApiResponse::error(msg)),
-        );
+    let num_files = files.len();
+
+    for (orig_filename, file_bytes) in files {
+        let extension = get_extension(&orig_filename).unwrap_or_default();
+
+        // Generate storage path
+        let (stored_path, full_path) =
+            generate_storage_path(&state.config.media_dir, MediaType::Gallery, &extension);
+
+        // Save file to disk
+        if let Err(e) = save_file(&full_path, &file_bytes).await {
+            tracing::error!("Failed to save file: {}", e);
+            // Clean up any files already saved to disk in this request
+            for path in &saved_paths {
+                let _ = delete_file(&state.config.media_dir, path).await;
+            }
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::error("Failed to save file to disk")),
+            );
+        }
+
+        // Track saved path for cleanup
+        saved_paths.push(stored_path.clone());
+
+        // Get MIME type
+        let mime_type = MediaType::Gallery.mime_type_for_extension(&extension);
+
+        // Determine title: if single file and title is provided, use it. Otherwise use original filename.
+        let item_title = if num_files == 1 && title.is_some() {
+            title.clone().unwrap()
+        } else {
+            orig_filename.clone()
+        };
+
+        let size_bytes = file_bytes.len() as i64;
+
+        // Insert into database
+        let result = sqlx::query(
+            "INSERT INTO gallery (user_id, title, original_filename, stored_path, size_bytes, mime_type) VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(auth_user.id)
+        .bind(&item_title)
+        .bind(&orig_filename)
+        .bind(&stored_path)
+        .bind(size_bytes)
+        .bind(mime_type)
+        .execute(&mut *tx)
+        .await;
+
+        match result {
+            Ok(res) => {
+                uploaded_items.push(GalleryItem {
+                    id: res.last_insert_id() as i32,
+                    user_id: auth_user.id,
+                    title: item_title,
+                    original_filename: orig_filename,
+                    stored_path,
+                    size_bytes,
+                    mime_type: mime_type.to_string(),
+                });
+            }
+            Err(e) => {
+                tracing::error!("Failed to insert gallery item: {}", e);
+                // Clean up the files
+                for path in &saved_paths {
+                    let _ = delete_file(&state.config.media_dir, path).await;
+                }
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ApiResponse::error("Failed to save image metadata")),
+                );
+            }
+        }
     }
 
-    // Generate storage path
-    let (stored_path, full_path) =
-        generate_storage_path(&state.config.media_dir, MediaType::Gallery, &extension);
-
-    // Save file to disk
-    if let Err(e) = save_file(&full_path, &file_bytes).await {
-        tracing::error!("Failed to save file: {}", e);
+    // Commit the transaction
+    if let Err(e) = tx.commit().await {
+        tracing::error!("Failed to commit database transaction: {}", e);
+        // Clean up the files
+        for path in &saved_paths {
+            let _ = delete_file(&state.config.media_dir, path).await;
+        }
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiResponse::error("Failed to save file")),
+            Json(ApiResponse::error("Failed to commit database transaction")),
         );
     }
 
-    // Get MIME type
-    let mime_type = MediaType::Gallery.mime_type_for_extension(&extension);
-
-    // Insert into database
-    let result = sqlx::query(
-        "INSERT INTO gallery (user_id, title, original_filename, stored_path, size_bytes, mime_type) VALUES (?, ?, ?, ?, ?, ?)",
-    )
-    .bind(auth_user.id)
-    .bind(&title)
-    .bind(&orig_filename)
-    .bind(&stored_path)
-    .bind(size_bytes as i64)
-    .bind(mime_type)
-    .execute(&state.db.pool)
-    .await;
-
-    match result {
-        Ok(res) => {
-            let item = GalleryItem {
-                id: res.last_insert_id() as i32,
-                user_id: auth_user.id,
-                title,
-                original_filename: orig_filename,
-                stored_path,
-                size_bytes: size_bytes as i64,
-                mime_type: mime_type.to_string(),
-            };
-            (StatusCode::CREATED, Json(ApiResponse::success(item)))
-        }
-        Err(e) => {
-            tracing::error!("Failed to insert gallery item: {}", e);
-            // Try to clean up the saved file
-            let _ = delete_file(&state.config.media_dir, &stored_path).await;
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiResponse::error("Failed to save image metadata")),
-            )
-        }
+    if num_files == 1 {
+        let single_item = uploaded_items.into_iter().next().unwrap();
+        (StatusCode::CREATED, Json(ApiResponse::success(UploadResponse::Single(single_item))))
+    } else {
+        (StatusCode::CREATED, Json(ApiResponse::success(UploadResponse::Bulk(uploaded_items))))
     }
 }
 
-// GET /api/gallery/:id - Get image metadata
+// GET /api/gallery/:id - Get image metadata (public)
 async fn get_image(
-    Extension(auth_user): Extension<AuthUser>,
     State(state): State<Arc<AppState>>,
     Path(id): Path<i32>,
 ) -> (StatusCode, Json<ApiResponse<GalleryItem>>) {
@@ -202,15 +258,7 @@ async fn get_image(
     .await;
 
     match item {
-        Ok(item) => {
-            if item.user_id != auth_user.id && !auth_user.can_view_all_media() {
-                return (
-                    StatusCode::FORBIDDEN,
-                    Json(ApiResponse::error("You can only view your own images")),
-                );
-            }
-            (StatusCode::OK, Json(ApiResponse::success(item)))
-        }
+        Ok(item) => (StatusCode::OK, Json(ApiResponse::success(item))),
         Err(_) => (
             StatusCode::NOT_FOUND,
             Json(ApiResponse::error("Image not found")),
@@ -218,9 +266,8 @@ async fn get_image(
     }
 }
 
-// GET /api/gallery/:id/download - Download the actual image file
+// GET /api/gallery/:id/download - Download the actual image file (public)
 async fn download_image(
-    Extension(auth_user): Extension<AuthUser>,
     State(state): State<Arc<AppState>>,
     Path(id): Path<i32>,
 ) -> Response {
@@ -233,14 +280,6 @@ async fn download_image(
 
     match item {
         Ok(item) => {
-            if item.user_id != auth_user.id && !auth_user.can_view_all_media() {
-                return (
-                    StatusCode::FORBIDDEN,
-                    Json(ApiResponse::<()>::error("You can only view your own images")),
-                )
-                    .into_response();
-            }
-
             match read_file(&state.config.media_dir, &item.stored_path).await {
                 Ok(data) => {
                     let body = Body::from(data);

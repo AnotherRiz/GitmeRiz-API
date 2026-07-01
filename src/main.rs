@@ -48,19 +48,21 @@ async fn main() {
     // Protected routes - require authentication
     let protected_routes = Router::new()
         .merge(users::protected_routes())
-        .merge(gallery::router())
+        .merge(gallery::protected_routes())
         .merge(video::router())
         .merge(audio::router())
         .merge(blog::router())
         .merge(notes::router())
         .merge(clipboard::router())
-        .layer(axum_middleware::from_fn_with_state(state.clone(), auth_middleware));
+        .layer(axum_middleware::from_fn_with_state(state.clone(), auth_middleware))
+        .layer(axum::extract::DefaultBodyLimit::disable());
 
     // Build router
     let app = Router::new()
         .route("/health", get(health::health_check))
         .nest("/api", Router::new()
             .merge(users::public_routes())
+            .merge(gallery::public_routes())
             .merge(protected_routes))
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::new()
