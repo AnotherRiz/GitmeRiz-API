@@ -33,6 +33,22 @@ impl Database {
         .execute(&self.pool)
         .await?;
 
+        // Check if gallery table has legacy schema (e.g. contains 'filename' column instead of 'original_filename')
+        let has_legacy_gallery = match sqlx::query("SHOW COLUMNS FROM gallery LIKE 'filename'")
+            .fetch_optional(&self.pool)
+            .await
+        {
+            Ok(Some(_)) => true,
+            _ => false,
+        };
+
+        if has_legacy_gallery {
+            tracing::info!("Dropping legacy gallery, videos, and audio tables to apply new schema");
+            let _ = sqlx::query("DROP TABLE IF EXISTS audio").execute(&self.pool).await;
+            let _ = sqlx::query("DROP TABLE IF EXISTS videos").execute(&self.pool).await;
+            let _ = sqlx::query("DROP TABLE IF EXISTS gallery").execute(&self.pool).await;
+        }
+
         // Create gallery table with file storage columns
         sqlx::query(
             r#"
