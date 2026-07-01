@@ -155,14 +155,14 @@ async fn upload_image(
 
         // Generate storage path
         let (stored_path, full_path) =
-            generate_storage_path(&state.config.media_dir, MediaType::Gallery, &extension);
+            generate_storage_path(&state.config.storage_dir, MediaType::Gallery, &extension);
 
         // Save file to disk
         if let Err(e) = save_file(&full_path, &file_bytes).await {
             tracing::error!("Failed to save file: {}", e);
             // Clean up any files already saved to disk in this request
             for path in &saved_paths {
-                let _ = delete_file(&state.config.media_dir, path).await;
+                let _ = delete_file(&state.config.storage_dir, path).await;
             }
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -214,7 +214,7 @@ async fn upload_image(
                 tracing::error!("Failed to insert gallery item: {}", e);
                 // Clean up the files
                 for path in &saved_paths {
-                    let _ = delete_file(&state.config.media_dir, path).await;
+                    let _ = delete_file(&state.config.storage_dir, path).await;
                 }
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -229,7 +229,7 @@ async fn upload_image(
         tracing::error!("Failed to commit database transaction: {}", e);
         // Clean up the files
         for path in &saved_paths {
-            let _ = delete_file(&state.config.media_dir, path).await;
+            let _ = delete_file(&state.config.storage_dir, path).await;
         }
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -280,7 +280,7 @@ async fn download_image(
 
     match item {
         Ok(item) => {
-            match read_file(&state.config.media_dir, &item.stored_path).await {
+            match read_file(&state.config.storage_dir, &item.stored_path).await {
                 Ok(data) => {
                     let body = Body::from(data);
                     Response::builder()
@@ -339,7 +339,7 @@ async fn delete_image(
             match result {
                 Ok(_) => {
                     // Delete file from disk
-                    if let Err(e) = delete_file(&state.config.media_dir, &item.stored_path).await {
+                    if let Err(e) = delete_file(&state.config.storage_dir, &item.stored_path).await {
                         tracing::warn!("Failed to delete file from disk: {}", e);
                     }
                     (

@@ -20,13 +20,6 @@ impl MediaType {
         }
     }
 
-    pub fn prefix(&self) -> &'static str {
-        match self {
-            MediaType::Gallery => "image",
-            MediaType::Video => "video",
-            MediaType::Audio => "audio",
-        }
-    }
 
     /// Returns allowed extensions for this media type (lowercase, with dot)
     pub fn allowed_extensions(&self) -> &[&'static str] {
@@ -84,24 +77,6 @@ impl MediaType {
     }
 }
 
-/// Get month name from month number
-fn month_name(month: u32) -> &'static str {
-    match month {
-        1 => "january",
-        2 => "february",
-        3 => "march",
-        4 => "april",
-        5 => "may",
-        6 => "june",
-        7 => "july",
-        8 => "august",
-        9 => "september",
-        10 => "october",
-        11 => "november",
-        12 => "december",
-        _ => "unknown",
-    }
-}
 
 /// Extract file extension from filename (lowercase, with dot)
 pub fn get_extension(filename: &str) -> Option<String> {
@@ -143,7 +118,7 @@ pub fn validate_size(media_type: MediaType, size_bytes: u64) -> Result<(), Strin
 /// Generate the storage path for a file
 /// Returns (relative_path, full_path)
 pub fn generate_storage_path(
-    media_dir: &str,
+    storage_dir: &str,
     media_type: MediaType,
     extension: &str,
 ) -> (String, PathBuf) {
@@ -157,13 +132,12 @@ pub fn generate_storage_path(
     
     let uuid = Uuid::new_v4();
     
-    // Folder: {type}/{YYYY}/{month}/{type-YYYY-MM-DD}/
+    // Folder: {type}/{YYYY}/{MM}/{YYYY-MM-DD}/
     let folder = format!(
-        "{}/{}/{}/{}-{:04}-{:02}-{:02}",
+        "{}/{}/{:02}/{:04}-{:02}-{:02}",
         media_type.folder_name(),
         year,
-        month_name(month),
-        media_type.prefix(),
+        month,
         year,
         month,
         day
@@ -176,7 +150,7 @@ pub fn generate_storage_path(
     );
     
     let relative_path = format!("{}/{}", folder, filename);
-    let full_path = PathBuf::from(media_dir).join(&relative_path);
+    let full_path = PathBuf::from(storage_dir).join(&relative_path);
     
     (relative_path, full_path)
 }
@@ -196,8 +170,8 @@ pub async fn save_file(path: &PathBuf, data: &[u8]) -> Result<(), std::io::Error
 }
 
 /// Delete file from disk
-pub async fn delete_file(media_dir: &str, stored_path: &str) -> Result<(), std::io::Error> {
-    let full_path = PathBuf::from(media_dir).join(stored_path);
+pub async fn delete_file(storage_dir: &str, stored_path: &str) -> Result<(), std::io::Error> {
+    let full_path = PathBuf::from(storage_dir).join(stored_path);
     if full_path.exists() {
         fs::remove_file(full_path).await?;
     }
@@ -205,7 +179,7 @@ pub async fn delete_file(media_dir: &str, stored_path: &str) -> Result<(), std::
 }
 
 /// Read file from disk
-pub async fn read_file(media_dir: &str, stored_path: &str) -> Result<Vec<u8>, std::io::Error> {
-    let full_path = PathBuf::from(media_dir).join(stored_path);
+pub async fn read_file(storage_dir: &str, stored_path: &str) -> Result<Vec<u8>, std::io::Error> {
+    let full_path = PathBuf::from(storage_dir).join(stored_path);
     fs::read(full_path).await
 }

@@ -130,7 +130,7 @@ async fn upload_video(
 
     // Generate storage path
     let (stored_path, full_path) =
-        generate_storage_path(&state.config.media_dir, MediaType::Video, &extension);
+        generate_storage_path(&state.config.storage_dir, MediaType::Video, &extension);
 
     // Save file to disk
     if let Err(e) = save_file(&full_path, &file_bytes).await {
@@ -172,7 +172,7 @@ async fn upload_video(
         }
         Err(e) => {
             tracing::error!("Failed to insert video item: {}", e);
-            let _ = delete_file(&state.config.media_dir, &stored_path).await;
+            let _ = delete_file(&state.config.storage_dir, &stored_path).await;
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ApiResponse::error("Failed to save video metadata")),
@@ -234,7 +234,7 @@ async fn download_video(
                     .into_response();
             }
 
-            match read_file(&state.config.media_dir, &item.stored_path).await {
+            match read_file(&state.config.storage_dir, &item.stored_path).await {
                 Ok(data) => {
                     let body = Body::from(data);
                     Response::builder()
@@ -291,7 +291,7 @@ async fn delete_video(
 
             match result {
                 Ok(_) => {
-                    if let Err(e) = delete_file(&state.config.media_dir, &item.stored_path).await {
+                    if let Err(e) = delete_file(&state.config.storage_dir, &item.stored_path).await {
                         tracing::warn!("Failed to delete file from disk: {}", e);
                     }
                     (
