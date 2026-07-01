@@ -1,14 +1,14 @@
+use std::sync::Arc;
 use axum::{
     body::Body,
     extract::{Multipart, Path, State},
-    http::{header, StatusCode},
-    response::{IntoResponse, Response},
-    routing::{delete, get, post},
+    http::{header, Response, StatusCode},
+    response::IntoResponse,
+    routing::{delete, get, post, patch},
     Extension, Json, Router,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
-use std::sync::Arc;
 
 use crate::media::{
     delete_file, generate_storage_path, read_file, save_file, validate_extension, validate_size,
@@ -26,6 +26,7 @@ pub struct GalleryItem {
     pub stored_path: String,
     pub size_bytes: i64,
     pub mime_type: String,
+    pub visibility: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -33,6 +34,16 @@ pub struct GalleryItem {
 pub enum UploadResponse {
     Single(GalleryItem),
     Bulk(Vec<GalleryItem>),
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateTitleRequest {
+    title: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateVisibilityRequest {
+    visibility: String,
 }
 
 pub fn public_routes() -> Router<Arc<AppState>> {
@@ -45,15 +56,18 @@ pub fn public_routes() -> Router<Arc<AppState>> {
 pub fn protected_routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/gallery", post(upload_image))
+        .route("/gallery/my", get(list_my_gallery))
         .route("/gallery/{id}", delete(delete_image))
+        .route("/gallery/{id}/title", patch(update_image_title))
+        .route("/gallery/{id}/visibility", patch(update_image_visibility))
 }
 
-// GET /api/gallery - List all images (public)
+// GET /api/gallery - List all public images
 async fn list_gallery(
     State(state): State<Arc<AppState>>,
 ) -> (StatusCode, Json<ApiResponse<Vec<GalleryItem>>>) {
     let items: Result<Vec<GalleryItem>, _> = sqlx::query_as(
-        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type FROM gallery",
+        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility FROM gallery WHERE visibility = 'public' ORDER BY id DESC",
     )
     .fetch_all(&state.db.pool)
     .await;
@@ -70,6 +84,30 @@ async fn list_gallery(
     }
 }
 
+// GET /api/gallery/my - List all user-specific images (public & private)
+async fn list_my_gallery(
+    Extension(auth_user): Extension<AuthUser>,
+    State(state): State<Arc<AppState>>,
+) -> (StatusCode, Json<ApiResponse<Vec<GalleryItem>>>) {
+    let items: Result<Vec<GalleryItem>, _> = sqlx::query_as(
+        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility FROM gallery WHERE user_id = ? ORDER BY id DESC",
+    )
+    .bind(auth_user.id)
+    .fetch_all(&state.db.pool)
+    .await;
+
+    match items {
+        Ok(items) => (StatusCode::OK, Json(ApiResponse::success(items))),
+        Err(e) => {
+            tracing::error!("Failed to fetch user gallery items: {:?}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::error("Failed to fetch gallery items")),
+            )
+        }
+    }
+}
+
 // POST /api/gallery - Upload image (multipart/form-data)
 async fn upload_image(
     Extension(auth_user): Extension<AuthUser>,
@@ -77,6 +115,7 @@ async fn upload_image(
     mut multipart: Multipart,
 ) -> (StatusCode, Json<ApiResponse<UploadResponse>>) {
     let mut title: Option<String> = None;
+    let mut visibility = "private".to_string();
     let mut files = Vec::new();
 
     // Parse multipart fields
@@ -87,6 +126,14 @@ async fn upload_image(
             "title" => {
                 if let Ok(text) = field.text().await {
                     title = Some(text);
+                }
+            }
+            "visibility" => {
+                if let Ok(text) = field.text().await {
+                    let val = text.trim().to_lowercase();
+                    if val == "public" || val == "private" {
+                        visibility = val;
+                    }
                 }
             }
             "file" => {
@@ -187,7 +234,7 @@ async fn upload_image(
 
         // Insert into database
         let result = sqlx::query(
-            "INSERT INTO gallery (user_id, title, original_filename, stored_path, size_bytes, mime_type) VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO gallery (user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility) VALUES (?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(auth_user.id)
         .bind(&item_title)
@@ -195,6 +242,7 @@ async fn upload_image(
         .bind(&stored_path)
         .bind(size_bytes)
         .bind(mime_type)
+        .bind(&visibility)
         .execute(&mut *tx)
         .await;
 
@@ -208,6 +256,7 @@ async fn upload_image(
                     stored_path,
                     size_bytes,
                     mime_type: mime_type.to_string(),
+                    visibility: visibility.clone(),
                 });
             }
             Err(e) => {
@@ -251,7 +300,7 @@ async fn get_image(
     Path(id): Path<i32>,
 ) -> (StatusCode, Json<ApiResponse<GalleryItem>>) {
     let item: Result<GalleryItem, _> = sqlx::query_as(
-        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type FROM gallery WHERE id = ?",
+        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility FROM gallery WHERE id = ?",
     )
     .bind(id)
     .fetch_one(&state.db.pool)
@@ -270,9 +319,9 @@ async fn get_image(
 async fn download_image(
     State(state): State<Arc<AppState>>,
     Path(id): Path<i32>,
-) -> Response {
+) -> impl IntoResponse {
     let item: Result<GalleryItem, _> = sqlx::query_as(
-        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type FROM gallery WHERE id = ?",
+        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility FROM gallery WHERE id = ?",
     )
     .bind(id)
     .fetch_one(&state.db.pool)
@@ -308,6 +357,121 @@ async fn download_image(
     }
 }
 
+// PATCH /api/gallery/:id/title - Rename image (owner or superuser)
+async fn update_image_title(
+    Extension(auth_user): Extension<AuthUser>,
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i32>,
+    Json(payload): Json<UpdateTitleRequest>,
+) -> (StatusCode, Json<ApiResponse<GalleryItem>>) {
+    if payload.title.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::error("Title cannot be empty")),
+        );
+    }
+
+    let item: Result<GalleryItem, _> = sqlx::query_as(
+        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility FROM gallery WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_one(&state.db.pool)
+    .await;
+
+    match item {
+        Ok(mut item) => {
+            if item.user_id != auth_user.id && !auth_user.is_superuser() {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(ApiResponse::error("You can only edit your own images")),
+                );
+            }
+
+            let result = sqlx::query("UPDATE gallery SET title = ? WHERE id = ?")
+                .bind(&payload.title)
+                .bind(id)
+                .execute(&state.db.pool)
+                .await;
+
+            match result {
+                Ok(_) => {
+                    item.title = payload.title;
+                    (StatusCode::OK, Json(ApiResponse::success(item)))
+                }
+                Err(e) => {
+                    tracing::error!("Failed to update image title: {:?}", e);
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ApiResponse::error("Failed to update image title")),
+                    )
+                }
+            }
+        }
+        Err(_) => (
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::error("Image not found")),
+        ),
+    }
+}
+
+// PATCH /api/gallery/:id/visibility - Change visibility (owner or superuser)
+async fn update_image_visibility(
+    Extension(auth_user): Extension<AuthUser>,
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i32>,
+    Json(payload): Json<UpdateVisibilityRequest>,
+) -> (StatusCode, Json<ApiResponse<GalleryItem>>) {
+    let val = payload.visibility.trim().to_lowercase();
+    if val != "public" && val != "private" {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::error("Visibility must be 'public' or 'private'")),
+        );
+    }
+
+    let item: Result<GalleryItem, _> = sqlx::query_as(
+        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility FROM gallery WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_one(&state.db.pool)
+    .await;
+
+    match item {
+        Ok(mut item) => {
+            if item.user_id != auth_user.id && !auth_user.is_superuser() {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(ApiResponse::error("You can only edit your own images")),
+                );
+            }
+
+            let result = sqlx::query("UPDATE gallery SET visibility = ? WHERE id = ?")
+                .bind(&val)
+                .bind(id)
+                .execute(&state.db.pool)
+                .await;
+
+            match result {
+                Ok(_) => {
+                    item.visibility = val;
+                    (StatusCode::OK, Json(ApiResponse::success(item)))
+                }
+                Err(e) => {
+                    tracing::error!("Failed to update image visibility: {:?}", e);
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ApiResponse::error("Failed to update image visibility")),
+                    )
+                }
+            }
+        }
+        Err(_) => (
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::error("Image not found")),
+        ),
+    }
+}
+
 // DELETE /api/gallery/:id - Delete image (owner or superuser)
 async fn delete_image(
     Extension(auth_user): Extension<AuthUser>,
@@ -315,7 +479,7 @@ async fn delete_image(
     Path(id): Path<i32>,
 ) -> (StatusCode, Json<ApiResponse<String>>) {
     let item: Result<GalleryItem, _> = sqlx::query_as(
-        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type FROM gallery WHERE id = ?",
+        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility FROM gallery WHERE id = ?",
     )
     .bind(id)
     .fetch_one(&state.db.pool)
