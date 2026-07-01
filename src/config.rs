@@ -6,7 +6,7 @@ pub struct Config {
     pub server_host: String,
     pub server_port: u16,
     pub jwt_secret: String,
-    pub media_dir: String,
+    pub storage_dir: String,
 }
 
 impl Config {
@@ -19,7 +19,7 @@ impl Config {
                 .parse()
                 .expect("SERVER_PORT must be a number"),
             jwt_secret: env::var("JWT_SECRET")?,
-            media_dir: env::var("MEDIA_DIR")?,
+            storage_dir: env::var("STORAGE_DIR")?,
         })
     }
 }
