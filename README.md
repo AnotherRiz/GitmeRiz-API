@@ -63,7 +63,17 @@ src/
    SERVER_HOST=localhost
    SERVER_PORT=3000
    JWT_SECRET=your-super-secret-jwt-key-change-in-production
+   STORAGE_DIR=./storage
+   FRONTEND_URL=http://localhost:5173
    ```
+   
+   **Environment Variables:**
+   - `DATABASE_URL` — MySQL connection string
+   - `SERVER_HOST` — Server host (default: `localhost`)
+   - `SERVER_PORT` — Server port (default: `3000`)
+   - `JWT_SECRET` — Secret key for JWT token signing (change in production!)
+   - `STORAGE_DIR` — Directory for uploaded media files (images, videos, audio)
+   - `FRONTEND_URL` — Frontend application URL for error page navigation (default: `http://localhost:5173`)
 
 3. Create the MySQL database:
    ```sql

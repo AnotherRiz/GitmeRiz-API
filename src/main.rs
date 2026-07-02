@@ -5,6 +5,7 @@ mod handlers;
 mod auth;
 mod middleware;
 mod media;
+mod error_page;
 
 use axum::{middleware as axum_middleware, routing::get, Router};
 use axum::http::{header, HeaderValue, Method};

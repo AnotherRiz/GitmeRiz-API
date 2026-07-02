@@ -7,6 +7,7 @@ pub struct Config {
     pub server_port: u16,
     pub jwt_secret: String,
     pub storage_dir: String,
+    pub frontend_url: String,
 }
 
 impl Config {
@@ -20,6 +21,7 @@ impl Config {
                 .expect("SERVER_PORT must be a number"),
             jwt_secret: env::var("JWT_SECRET")?,
             storage_dir: env::var("STORAGE_DIR")?,
+            frontend_url: env::var("FRONTEND_URL").unwrap_or_else(|_| "http://localhost:5173".to_string()),
         })
     }
 }

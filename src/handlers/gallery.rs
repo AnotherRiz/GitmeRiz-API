@@ -13,6 +13,7 @@ use sqlx::FromRow;
 use tower_cookies::Cookies;
 
 use crate::auth::validate_token;
+use crate::error_page::build_error_response;
 use crate::media::{
     delete_file, generate_storage_path, read_file, save_file, validate_extension, validate_size,
     get_extension, generate_short_id, generate_thumbnail_path, generate_and_encode_thumbnail, MediaType,
@@ -719,11 +720,12 @@ async fn serve_raw_image(
                         }
                         Err(e) => {
                             tracing::warn!("Signed URL validation failed: {}", e);
-                            return (
+                            return build_error_response(
                                 StatusCode::UNAUTHORIZED,
-                                Json(ApiResponse::<()>::error(e)),
-                            )
-                                .into_response();
+                                e,
+                                &headers,
+                                &state.config.frontend_url,
+                            );
                         }
                     }
                 } else {
@@ -734,20 +736,22 @@ async fn serve_raw_image(
                         Some(user) => {
                             // Check if user is owner or superuser
                             if item.user_id != user.id && !user.is_superuser() {
-                                return (
+                                return build_error_response(
                                     StatusCode::FORBIDDEN,
-                                    Json(ApiResponse::<()>::error("You can only access your own private images")),
-                                )
-                                    .into_response();
+                                    "You can only access your own private images",
+                                    &headers,
+                                    &state.config.frontend_url,
+                                );
                             }
                             // Access granted, continue to serve file
                         }
                         None => {
-                            return (
+                            return build_error_response(
                                 StatusCode::UNAUTHORIZED,
-                                Json(ApiResponse::<()>::error("This image is private. Authentication required.")),
-                            )
-                                .into_response();
+                                "This image is private. Authentication required.",
+                                &headers,
+                                &state.config.frontend_url,
+                            );
                         }
                     }
                 }
@@ -766,18 +770,20 @@ async fn serve_raw_image(
                         .body(body)
                         .unwrap()
                 }
-                Err(_) => (
+                Err(_) => build_error_response(
                     StatusCode::NOT_FOUND,
-                    Json(ApiResponse::<()>::error("File not found on disk")),
-                )
-                    .into_response(),
+                    "File not found on disk",
+                    &headers,
+                    &state.config.frontend_url,
+                ),
             }
         }
-        Err(_) => (
+        Err(_) => build_error_response(
             StatusCode::NOT_FOUND,
-            Json(ApiResponse::<()>::error("Image not found")),
-        )
-            .into_response(),
+            "Image not found",
+            &headers,
+            &state.config.frontend_url,
+        ),
     }
 }
 
@@ -811,11 +817,12 @@ async fn serve_thumbnail_image(
                         }
                         Err(e) => {
                             tracing::warn!("Signed URL validation failed: {}", e);
-                            return (
+                            return build_error_response(
                                 StatusCode::UNAUTHORIZED,
-                                Json(ApiResponse::<()>::error(e)),
-                            )
-                                .into_response();
+                                e,
+                                &headers,
+                                &state.config.frontend_url,
+                            );
                         }
                     }
                 } else {
@@ -826,20 +833,22 @@ async fn serve_thumbnail_image(
                         Some(user) => {
                             // Check if user is owner or superuser
                             if item.user_id != user.id && !user.is_superuser() {
-                                return (
+                                return build_error_response(
                                     StatusCode::FORBIDDEN,
-                                    Json(ApiResponse::<()>::error("You can only access your own private images")),
-                                )
-                                    .into_response();
+                                    "You can only access your own private images",
+                                    &headers,
+                                    &state.config.frontend_url,
+                                );
                             }
                             // Access granted, continue to serve thumbnail
                         }
                         None => {
-                            return (
+                            return build_error_response(
                                 StatusCode::UNAUTHORIZED,
-                                Json(ApiResponse::<()>::error("This image is private. Authentication required.")),
-                            )
-                                .into_response();
+                                "This image is private. Authentication required.",
+                                &headers,
+                                &state.config.frontend_url,
+                            );
                         }
                     }
                 }
@@ -872,18 +881,20 @@ async fn serve_thumbnail_image(
                         .body(body)
                         .unwrap()
                 }
-                Err(_) => (
+                Err(_) => build_error_response(
                     StatusCode::NOT_FOUND,
-                    Json(ApiResponse::<()>::error("Thumbnail not found on disk")),
-                )
-                    .into_response(),
+                    "Thumbnail not found on disk",
+                    &headers,
+                    &state.config.frontend_url,
+                ),
             }
         }
-        Err(_) => (
+        Err(_) => build_error_response(
             StatusCode::NOT_FOUND,
-            Json(ApiResponse::<()>::error("Image not found")),
-        )
-            .into_response(),
+            "Image not found",
+            &headers,
+            &state.config.frontend_url,
+        ),
     }
 }
 
