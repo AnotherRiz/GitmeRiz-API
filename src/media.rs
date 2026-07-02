@@ -1,4 +1,5 @@
 use chrono::{Datelike, Timelike, Utc};
+use rand::Rng;
 use std::path::PathBuf;
 use tokio::fs;
 use uuid::Uuid;
@@ -182,4 +183,74 @@ pub async fn delete_file(storage_dir: &str, stored_path: &str) -> Result<(), std
 pub async fn read_file(storage_dir: &str, stored_path: &str) -> Result<Vec<u8>, std::io::Error> {
     let full_path = PathBuf::from(storage_dir).join(stored_path);
     fs::read(full_path).await
+}
+
+/// Generate a random 8-character short ID using URL-safe alphanumeric characters
+pub fn generate_short_id() -> String {
+    const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    let mut rng = rand::thread_rng();
+    
+    (0..8)
+        .map(|_| {
+            let idx = rng.gen_range(0..CHARSET.len());
+            CHARSET[idx] as char
+        })
+        .collect()
+}
+
+/// Generate thumbnail path from original stored path
+/// Converts: gallery/2026/07/2026-07-01/2026-07-01_15-15-01_UUID.png
+/// To:       gallery/2026/07/2026-07-01/2026-07-01_15-15-01_UUID-thumb.webp
+pub fn generate_thumbnail_path(original_stored_path: &str) -> String {
+    // Remove extension from original path
+    let path_without_ext = if let Some(pos) = original_stored_path.rfind('.') {
+        &original_stored_path[..pos]
+    } else {
+        original_stored_path
+    };
+    
+    // Append -thumb.webp
+    format!("{}-thumb.webp", path_without_ext)
+}
+
+/// Generate thumbnail from image bytes
+/// - Max width: 500-600px (proportional resize, aspect ratio maintained)
+/// - Format: WebP with 80% quality
+/// - Returns: WebP bytes
+pub fn generate_and_encode_thumbnail(image_data: &[u8], max_width: u32) -> Result<Vec<u8>, String> {
+    use image::codecs::webp::WebPEncoder;
+    use image::{GenericImageView, ImageReader};
+    use std::io::Cursor;
+    
+    // Load image from bytes
+    let img = ImageReader::new(Cursor::new(image_data))
+        .with_guessed_format()
+        .map_err(|e| format!("Failed to detect image format: {}", e))?
+        .decode()
+        .map_err(|e| format!("Failed to decode image: {}", e))?;
+    
+    let (orig_width, orig_height) = img.dimensions();
+    
+    // Calculate new dimensions (aspect ratio preserved)
+    let (new_width, new_height) = if orig_width > max_width {
+        let ratio = max_width as f32 / orig_width as f32;
+        let new_height = (orig_height as f32 * ratio) as u32;
+        (max_width, new_height)
+    } else {
+        // Image already smaller than max_width, keep original size
+        (orig_width, orig_height)
+    };
+    
+    // Resize image
+    let resized = img.resize(new_width, new_height, image::imageops::FilterType::Lanczos3);
+    
+    // Encode to WebP lossy with quality 80
+    let mut buffer = Vec::new();
+    let encoder = WebPEncoder::new_lossless(&mut buffer);
+    
+    resized
+        .write_with_encoder(encoder)
+        .map_err(|e| format!("Failed to encode WebP: {}", e))?;
+    
+    Ok(buffer)
 }

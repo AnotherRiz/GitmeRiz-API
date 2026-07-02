@@ -5,6 +5,7 @@ use axum::{
     Extension, Json, Router,
 };
 use std::sync::Arc;
+use tower_cookies::{Cookie, Cookies};
 
 use crate::auth::{create_token, hash_password, verify_password};
 use crate::models::{
@@ -17,6 +18,7 @@ pub fn public_routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/register", post(register))
         .route("/login", post(login))
+        .route("/logout", post(logout))
 }
 
 // Protected routes (authentication required) - middleware applied in main.rs
@@ -87,6 +89,7 @@ async fn register(
 // POST /api/login
 async fn login(
     State(state): State<Arc<AppState>>,
+    cookies: Cookies,
     Json(payload): Json<LoginRequest>,
 ) -> (StatusCode, Json<ApiResponse<LoginResponse>>) {
     // Find user by username
@@ -118,6 +121,15 @@ async fn login(
                         }
                     };
 
+                    // Set httpOnly cookie
+                    let mut cookie = Cookie::new("auth_token", token.clone());
+                    cookie.set_http_only(true);
+                    cookie.set_secure(false); // Set to true in production (HTTPS only)
+                    cookie.set_same_site(tower_cookies::cookie::SameSite::Lax); // Changed from None to Lax for localhost
+                    cookie.set_path("/");
+                    cookie.set_max_age(tower_cookies::cookie::time::Duration::days(365));
+                    cookies.add(cookie);
+
                     let response = LoginResponse {
                         message: "Login successful".to_string(),
                         token,
@@ -136,6 +148,21 @@ async fn login(
             Json(ApiResponse::error("Invalid credentials")),
         ),
     }
+}
+
+// POST /api/logout
+async fn logout(cookies: Cookies) -> (StatusCode, Json<ApiResponse<String>>) {
+    // Clear the cookie by setting max_age to 0
+    let mut cookie = Cookie::new("auth_token", "");
+    cookie.set_http_only(true);
+    cookie.set_path("/");
+    cookie.set_max_age(tower_cookies::cookie::time::Duration::seconds(0));
+    cookies.add(cookie);
+
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success("Logged out successfully".to_string())),
+    )
 }
 
 // GET /api/users/me - Get current authenticated user

@@ -16,7 +16,7 @@ pub fn verify_password(password: &str, hash: &str) -> Result<bool, bcrypt::Bcryp
 // JWT token creation
 pub fn create_token(user_id: i32, username: &str, role: &str, secret: &str) -> Result<String, jsonwebtoken::errors::Error> {
     let now = Utc::now();
-    let exp = now + Duration::days(36500); // Token valid for 100 years (effectively non-expiring)
+    let exp = now + Duration::days(365); // Token valid for 365 days (1 year)
 
     let claims = Claims {
         sub: user_id,

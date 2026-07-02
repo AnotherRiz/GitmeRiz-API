@@ -7,9 +7,11 @@ mod middleware;
 mod media;
 
 use axum::{middleware as axum_middleware, routing::get, Router};
+use axum::http::{header, HeaderValue, Method};
 use std::sync::Arc;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
+use tower_cookies::CookieManagerLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::config::Config;
@@ -57,18 +59,25 @@ async fn main() {
         .layer(axum_middleware::from_fn_with_state(state.clone(), auth_middleware))
         .layer(axum::extract::DefaultBodyLimit::disable());
 
+    // CORS configuration - must be specific origin when using credentials
+    let cors = CorsLayer::new()
+        .allow_origin([
+            "http://localhost:5173".parse::<HeaderValue>().unwrap(),
+        ])
+        .allow_methods([Method::GET, Method::POST, Method::PATCH, Method::DELETE, Method::PUT, Method::OPTIONS])
+        .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION, header::COOKIE])
+        .allow_credentials(true)
+        .expose_headers([header::SET_COOKIE]);
+
     // Build router
     let app = Router::new()
         .route("/health", get(health::health_check))
-        .nest("/api", Router::new()
-            .merge(users::public_routes())
-            .merge(gallery::public_routes())
-            .merge(protected_routes))
+        .merge(users::public_routes())
+        .merge(gallery::public_routes())
+        .merge(protected_routes)
+        .layer(cors)
+        .layer(CookieManagerLayer::new())
         .layer(TraceLayer::new_for_http())
-        .layer(CorsLayer::new()
-            .allow_origin(Any)
-            .allow_methods(Any)
-            .allow_headers(Any))
         .with_state(state);
 
     // Start server
