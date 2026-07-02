@@ -86,6 +86,72 @@ impl Database {
                 .await?;
         }
 
+        // Check if gallery table is missing 'short_id' column (for existing installations)
+        let has_short_id = match sqlx::query("SHOW COLUMNS FROM gallery LIKE 'short_id'")
+            .fetch_optional(&self.pool)
+            .await
+        {
+            Ok(Some(_)) => true,
+            _ => false,
+        };
+
+        if !has_short_id {
+            tracing::info!("Adding short_id column to gallery table");
+            // Add column as nullable first
+            sqlx::query("ALTER TABLE gallery ADD COLUMN short_id CHAR(8)")
+                .execute(&self.pool)
+                .await?;
+
+            // Backfill existing rows with unique short_ids
+            let existing_rows: Vec<(i32,)> = sqlx::query_as("SELECT id FROM gallery WHERE short_id IS NULL")
+                .fetch_all(&self.pool)
+                .await?;
+
+            for (id,) in existing_rows {
+                loop {
+                    let short_id = crate::media::generate_short_id();
+                    let result = sqlx::query("UPDATE gallery SET short_id = ? WHERE id = ?")
+                        .bind(&short_id)
+                        .bind(id)
+                        .execute(&self.pool)
+                        .await;
+                    
+                    if result.is_ok() {
+                        break;
+                    }
+                    // If collision, retry with new short_id
+                }
+            }
+
+            // Now make it NOT NULL and UNIQUE
+            sqlx::query("ALTER TABLE gallery MODIFY COLUMN short_id CHAR(8) NOT NULL")
+                .execute(&self.pool)
+                .await?;
+            sqlx::query("ALTER TABLE gallery ADD UNIQUE KEY unique_short_id (short_id)")
+                .execute(&self.pool)
+                .await?;
+            
+            tracing::info!("Gallery short_id column added and backfilled successfully");
+        }
+
+        // Check if gallery table is missing 'thumbnail_path' column (for pre-generated thumbnails)
+        let has_thumbnail_path = match sqlx::query("SHOW COLUMNS FROM gallery LIKE 'thumbnail_path'")
+            .fetch_optional(&self.pool)
+            .await
+        {
+            Ok(Some(_)) => true,
+            _ => false,
+        };
+
+        if !has_thumbnail_path {
+            tracing::info!("Adding thumbnail_path column to gallery table");
+            sqlx::query("ALTER TABLE gallery ADD COLUMN thumbnail_path VARCHAR(512)")
+                .execute(&self.pool)
+                .await?;
+            
+            tracing::info!("Gallery thumbnail_path column added successfully");
+        }
+
         // Create videos table with file storage columns
         sqlx::query(
             r#"

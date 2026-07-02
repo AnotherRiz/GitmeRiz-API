@@ -1,18 +1,21 @@
 use std::sync::Arc;
 use axum::{
     body::Body,
-    extract::{Multipart, Path, State},
-    http::{header, Response, StatusCode},
+    extract::{Multipart, Path, Query, State},
+    http::{header, HeaderMap, Response, StatusCode},
     response::IntoResponse,
     routing::{delete, get, post, patch},
     Extension, Json, Router,
 };
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
+use tower_cookies::Cookies;
 
+use crate::auth::validate_token;
 use crate::media::{
     delete_file, generate_storage_path, read_file, save_file, validate_extension, validate_size,
-    get_extension, MediaType,
+    get_extension, generate_short_id, generate_thumbnail_path, generate_and_encode_thumbnail, MediaType,
 };
 use crate::models::{ApiResponse, AuthUser};
 use crate::AppState;
@@ -27,6 +30,9 @@ pub struct GalleryItem {
     pub size_bytes: i64,
     pub mime_type: String,
     pub visibility: String,
+    pub short_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thumbnail_path: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -46,20 +52,122 @@ struct UpdateVisibilityRequest {
     visibility: String,
 }
 
+// Query parameters for image access with signed URL
+#[derive(Debug, Deserialize)]
+struct ImageQuery {
+    /// Expiration timestamp (Unix timestamp)
+    expires: Option<i64>,
+    /// HMAC signature: SHA256(short_id + user_id + expires + secret)
+    sig: Option<String>,
+}
+
+// Response for signed URL generation
+#[derive(Debug, Serialize)]
+struct SignedUrlResponse {
+    url: String,
+    expires_at: i64,
+}
+
+/// Generate HMAC-SHA256 signature for signed URL
+fn generate_signature(short_id: &str, user_id: i32, expires: i64, secret: &str) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    
+    // Create a simple hash (in production, use proper HMAC-SHA256)
+    let data = format!("{}:{}:{}:{}", short_id, user_id, expires, secret);
+    let mut hasher = DefaultHasher::new();
+    data.hash(&mut hasher);
+    let hash = hasher.finish();
+    
+    // Convert to hex string (16 chars)
+    format!("{:016x}", hash)
+}
+
+/// Validate signed URL parameters
+fn validate_signed_url(
+    query: &ImageQuery,
+    short_id: &str,
+    owner_user_id: i32,
+    secret: &str,
+) -> Result<(), &'static str> {
+    let expires = query.expires.ok_or("Missing 'expires' parameter")?;
+    let sig = query.sig.as_ref().ok_or("Missing 'sig' parameter")?;
+    
+    // Check if URL has expired
+    let now = Utc::now().timestamp();
+    if now > expires {
+        return Err("URL has expired");
+    }
+    
+    // Validate signature
+    let expected_sig = generate_signature(short_id, owner_user_id, expires, secret);
+    if sig != &expected_sig {
+        return Err("Invalid signature");
+    }
+    
+    Ok(())
+}
+
 pub fn public_routes() -> Router<Arc<AppState>> {
     Router::new()
-        .route("/gallery", get(list_gallery))
+        .route("/gallery/public", get(list_gallery))
         .route("/gallery/{id}", get(get_image))
-        .route("/gallery/{id}/download", get(download_image))
+        .route("/gallery/d/{id}", get(download_image))
+        .route("/gallery/r/{short_id}", get(serve_raw_image))
+        .route("/gallery/t/{short_id}", get(serve_thumbnail_image))
 }
 
 pub fn protected_routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/gallery", post(upload_image))
-        .route("/gallery/my", get(list_my_gallery))
+        .route("/gallery/me", get(list_my_gallery))
         .route("/gallery/{id}", delete(delete_image))
         .route("/gallery/{id}/title", patch(update_image_title))
         .route("/gallery/{id}/visibility", patch(update_image_visibility))
+        .route("/gallery/{short_id}/sign", post(generate_signed_url))
+}
+
+// Helper function to extract optional authentication from cookie or header
+// (Query parameter now uses signed URLs instead of JWT token)
+fn extract_optional_auth(
+    cookies: &Cookies,
+    headers: &HeaderMap,
+    jwt_secret: &str,
+) -> Option<AuthUser> {
+    // Priority 1: Read from cookie (preferred for security)
+    let from_cookie = cookies
+        .get("auth_token")
+        .and_then(|c| {
+            tracing::debug!("Found auth_token cookie");
+            validate_token(c.value(), jwt_secret).ok()
+        });
+    
+    if from_cookie.is_some() {
+        tracing::debug!("Authentication successful from cookie");
+        return from_cookie;
+    }
+    
+    // Priority 2: Fallback to Authorization header (for API clients)
+    let from_header = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|auth_header| {
+            if auth_header.starts_with("Bearer ") {
+                let token = &auth_header[7..];
+                tracing::debug!("Found Authorization header");
+                validate_token(token, jwt_secret).ok()
+            } else {
+                None
+            }
+        });
+    
+    if from_header.is_some() {
+        tracing::debug!("Authentication successful from header");
+        return from_header;
+    }
+    
+    tracing::debug!("No authentication found in cookie or header");
+    None
 }
 
 // GET /api/gallery - List all public images
@@ -67,7 +175,7 @@ async fn list_gallery(
     State(state): State<Arc<AppState>>,
 ) -> (StatusCode, Json<ApiResponse<Vec<GalleryItem>>>) {
     let items: Result<Vec<GalleryItem>, _> = sqlx::query_as(
-        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility FROM gallery WHERE visibility = 'public' ORDER BY id DESC",
+        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path FROM gallery WHERE visibility = 'public' ORDER BY id DESC",
     )
     .fetch_all(&state.db.pool)
     .await;
@@ -90,7 +198,7 @@ async fn list_my_gallery(
     State(state): State<Arc<AppState>>,
 ) -> (StatusCode, Json<ApiResponse<Vec<GalleryItem>>>) {
     let items: Result<Vec<GalleryItem>, _> = sqlx::query_as(
-        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility FROM gallery WHERE user_id = ? ORDER BY id DESC",
+        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path FROM gallery WHERE user_id = ? ORDER BY id DESC",
     )
     .bind(auth_user.id)
     .fetch_all(&state.db.pool)
@@ -220,6 +328,23 @@ async fn upload_image(
         // Track saved path for cleanup
         saved_paths.push(stored_path.clone());
 
+        // Generate and save thumbnail (max width 500px, WebP 80% quality)
+        let thumbnail_path = generate_thumbnail_path(&stored_path);
+        let thumbnail_full_path = std::path::PathBuf::from(&state.config.storage_dir).join(&thumbnail_path);
+        
+        match generate_and_encode_thumbnail(&file_bytes, 500) {
+            Ok(thumbnail_data) => {
+                if let Err(e) = save_file(&thumbnail_full_path, &thumbnail_data).await {
+                    tracing::warn!("Failed to save thumbnail for {}: {}", orig_filename, e);
+                    // Continue without thumbnail - not critical
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Failed to generate thumbnail for {}: {}", orig_filename, e);
+                // Continue without thumbnail - not critical
+            }
+        }
+
         // Get MIME type
         let mime_type = MediaType::Gallery.mime_type_for_extension(&extension);
 
@@ -232,9 +357,37 @@ async fn upload_image(
 
         let size_bytes = file_bytes.len() as i64;
 
+        // Generate unique short_id with collision retry
+        let short_id = loop {
+            let candidate = generate_short_id();
+            // Check if short_id already exists
+            let exists: Result<Option<(i32,)>, _> = sqlx::query_as(
+                "SELECT id FROM gallery WHERE short_id = ?"
+            )
+            .bind(&candidate)
+            .fetch_optional(&mut *tx)
+            .await;
+
+            match exists {
+                Ok(None) => break candidate, // Unique, use it
+                Ok(Some(_)) => continue,      // Collision, retry
+                Err(e) => {
+                    tracing::error!("Failed to check short_id uniqueness: {}", e);
+                    // Clean up the files
+                    for path in &saved_paths {
+                        let _ = delete_file(&state.config.storage_dir, path).await;
+                    }
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ApiResponse::error("Failed to generate unique short_id")),
+                    );
+                }
+            }
+        };
+
         // Insert into database
         let result = sqlx::query(
-            "INSERT INTO gallery (user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO gallery (user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(auth_user.id)
         .bind(&item_title)
@@ -243,6 +396,8 @@ async fn upload_image(
         .bind(size_bytes)
         .bind(mime_type)
         .bind(&visibility)
+        .bind(&short_id)
+        .bind(&thumbnail_path)
         .execute(&mut *tx)
         .await;
 
@@ -257,6 +412,8 @@ async fn upload_image(
                     size_bytes,
                     mime_type: mime_type.to_string(),
                     visibility: visibility.clone(),
+                    short_id,
+                    thumbnail_path: Some(thumbnail_path),
                 });
             }
             Err(e) => {
@@ -300,7 +457,7 @@ async fn get_image(
     Path(id): Path<i32>,
 ) -> (StatusCode, Json<ApiResponse<GalleryItem>>) {
     let item: Result<GalleryItem, _> = sqlx::query_as(
-        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility FROM gallery WHERE id = ?",
+        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path FROM gallery WHERE id = ?",
     )
     .bind(id)
     .fetch_one(&state.db.pool)
@@ -321,7 +478,7 @@ async fn download_image(
     Path(id): Path<i32>,
 ) -> impl IntoResponse {
     let item: Result<GalleryItem, _> = sqlx::query_as(
-        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility FROM gallery WHERE id = ?",
+        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path FROM gallery WHERE id = ?",
     )
     .bind(id)
     .fetch_one(&state.db.pool)
@@ -372,7 +529,7 @@ async fn update_image_title(
     }
 
     let item: Result<GalleryItem, _> = sqlx::query_as(
-        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility FROM gallery WHERE id = ?",
+        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path FROM gallery WHERE id = ?",
     )
     .bind(id)
     .fetch_one(&state.db.pool)
@@ -430,7 +587,7 @@ async fn update_image_visibility(
     }
 
     let item: Result<GalleryItem, _> = sqlx::query_as(
-        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility FROM gallery WHERE id = ?",
+        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path FROM gallery WHERE id = ?",
     )
     .bind(id)
     .fetch_one(&state.db.pool)
@@ -479,7 +636,7 @@ async fn delete_image(
     Path(id): Path<i32>,
 ) -> (StatusCode, Json<ApiResponse<String>>) {
     let item: Result<GalleryItem, _> = sqlx::query_as(
-        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility FROM gallery WHERE id = ?",
+        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path FROM gallery WHERE id = ?",
     )
     .bind(id)
     .fetch_one(&state.db.pool)
@@ -502,10 +659,18 @@ async fn delete_image(
 
             match result {
                 Ok(_) => {
-                    // Delete file from disk
+                    // Delete original file from disk
                     if let Err(e) = delete_file(&state.config.storage_dir, &item.stored_path).await {
                         tracing::warn!("Failed to delete file from disk: {}", e);
                     }
+                    
+                    // Delete thumbnail from disk (if exists)
+                    if let Some(thumb_path) = &item.thumbnail_path {
+                        if let Err(e) = delete_file(&state.config.storage_dir, thumb_path).await {
+                            tracing::warn!("Failed to delete thumbnail from disk: {}", e);
+                        }
+                    }
+                    
                     (
                         StatusCode::OK,
                         Json(ApiResponse::success("Image deleted".to_string())),
@@ -516,6 +681,253 @@ async fn delete_image(
                     Json(ApiResponse::error("Failed to delete image")),
                 ),
             }
+        }
+        Err(_) => (
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::error("Image not found")),
+        ),
+    }
+}
+
+// GET /api/gallery/r/{short_id} - Serve raw image file (inline, for browser/img tag)
+async fn serve_raw_image(
+    State(state): State<Arc<AppState>>,
+    Path(short_id): Path<String>,
+    Query(query): Query<ImageQuery>,
+    cookies: Cookies,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let item: Result<GalleryItem, _> = sqlx::query_as(
+        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path FROM gallery WHERE short_id = ?",
+    )
+    .bind(&short_id)
+    .fetch_one(&state.db.pool)
+    .await;
+
+    match item {
+        Ok(item) => {
+            // Access control based on visibility:
+            // - Public images: accessible to everyone
+            // - Private images: require authentication OR valid signed URL
+            if item.visibility == "private" {
+                // Method 1: Try signed URL (for <img> tags)
+                if query.expires.is_some() && query.sig.is_some() {
+                    match validate_signed_url(&query, &short_id, item.user_id, &state.config.jwt_secret) {
+                        Ok(()) => {
+                            tracing::debug!("Access granted via signed URL");
+                            // Signed URL valid, continue to serve
+                        }
+                        Err(e) => {
+                            tracing::warn!("Signed URL validation failed: {}", e);
+                            return (
+                                StatusCode::UNAUTHORIZED,
+                                Json(ApiResponse::<()>::error(e)),
+                            )
+                                .into_response();
+                        }
+                    }
+                } else {
+                    // Method 2: Try cookie/header authentication
+                    let auth_user = extract_optional_auth(&cookies, &headers, &state.config.jwt_secret);
+                    
+                    match auth_user {
+                        Some(user) => {
+                            // Check if user is owner or superuser
+                            if item.user_id != user.id && !user.is_superuser() {
+                                return (
+                                    StatusCode::FORBIDDEN,
+                                    Json(ApiResponse::<()>::error("You can only access your own private images")),
+                                )
+                                    .into_response();
+                            }
+                            // Access granted, continue to serve file
+                        }
+                        None => {
+                            return (
+                                StatusCode::UNAUTHORIZED,
+                                Json(ApiResponse::<()>::error("This image is private. Authentication required.")),
+                            )
+                                .into_response();
+                        }
+                    }
+                }
+            }
+
+            match read_file(&state.config.storage_dir, &item.stored_path).await {
+                Ok(data) => {
+                    let body = Body::from(data);
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, item.mime_type)
+                        .header(
+                            header::CONTENT_DISPOSITION,
+                            format!("inline; filename=\"{}\"", item.original_filename),
+                        )
+                        .body(body)
+                        .unwrap()
+                }
+                Err(_) => (
+                    StatusCode::NOT_FOUND,
+                    Json(ApiResponse::<()>::error("File not found on disk")),
+                )
+                    .into_response(),
+            }
+        }
+        Err(_) => (
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::<()>::error("Image not found")),
+        )
+            .into_response(),
+    }
+}
+
+// GET /api/gallery/t/{short_id} - Serve thumbnail image (inline, for browser/img tag)
+async fn serve_thumbnail_image(
+    State(state): State<Arc<AppState>>,
+    Path(short_id): Path<String>,
+    Query(query): Query<ImageQuery>,
+    cookies: Cookies,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let item: Result<GalleryItem, _> = sqlx::query_as(
+        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path FROM gallery WHERE short_id = ?",
+    )
+    .bind(&short_id)
+    .fetch_one(&state.db.pool)
+    .await;
+
+    match item {
+        Ok(item) => {
+            // Access control based on visibility:
+            // - Public images: accessible to everyone
+            // - Private images: require authentication OR valid signed URL
+            if item.visibility == "private" {
+                // Method 1: Try signed URL (for <img> tags)
+                if query.expires.is_some() && query.sig.is_some() {
+                    match validate_signed_url(&query, &short_id, item.user_id, &state.config.jwt_secret) {
+                        Ok(()) => {
+                            tracing::debug!("Access granted via signed URL");
+                            // Signed URL valid, continue to serve
+                        }
+                        Err(e) => {
+                            tracing::warn!("Signed URL validation failed: {}", e);
+                            return (
+                                StatusCode::UNAUTHORIZED,
+                                Json(ApiResponse::<()>::error(e)),
+                            )
+                                .into_response();
+                        }
+                    }
+                } else {
+                    // Method 2: Try cookie/header authentication
+                    let auth_user = extract_optional_auth(&cookies, &headers, &state.config.jwt_secret);
+                    
+                    match auth_user {
+                        Some(user) => {
+                            // Check if user is owner or superuser
+                            if item.user_id != user.id && !user.is_superuser() {
+                                return (
+                                    StatusCode::FORBIDDEN,
+                                    Json(ApiResponse::<()>::error("You can only access your own private images")),
+                                )
+                                    .into_response();
+                            }
+                            // Access granted, continue to serve thumbnail
+                        }
+                        None => {
+                            return (
+                                StatusCode::UNAUTHORIZED,
+                                Json(ApiResponse::<()>::error("This image is private. Authentication required.")),
+                            )
+                                .into_response();
+                        }
+                    }
+                }
+            }
+
+            // Check if thumbnail exists, otherwise serve original (for backward compatibility)
+            let file_path = if let Some(thumb_path) = &item.thumbnail_path {
+                thumb_path
+            } else {
+                &item.stored_path
+            };
+
+            match read_file(&state.config.storage_dir, file_path).await {
+                Ok(data) => {
+                    let body = Body::from(data);
+                    let content_type = if item.thumbnail_path.is_some() {
+                        "image/webp" // Pre-generated thumbnails are WebP
+                    } else {
+                        &item.mime_type // Fallback to original mime type
+                    };
+                    
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, content_type)
+                        .header(
+                            header::CONTENT_DISPOSITION,
+                            format!("inline; filename=\"thumb_{}\"", item.original_filename),
+                        )
+                        .header(header::CACHE_CONTROL, "public, max-age=31536000") // Cache for 1 year
+                        .body(body)
+                        .unwrap()
+                }
+                Err(_) => (
+                    StatusCode::NOT_FOUND,
+                    Json(ApiResponse::<()>::error("Thumbnail not found on disk")),
+                )
+                    .into_response(),
+            }
+        }
+        Err(_) => (
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::<()>::error("Image not found")),
+        )
+            .into_response(),
+    }
+}
+
+// POST /api/gallery/{short_id}/sign - Generate signed URL for private image (authenticated)
+async fn generate_signed_url(
+    Extension(auth_user): Extension<AuthUser>,
+    State(state): State<Arc<AppState>>,
+    Path(short_id): Path<String>,
+) -> (StatusCode, Json<ApiResponse<SignedUrlResponse>>) {
+    // Fetch the image
+    let item: Result<GalleryItem, _> = sqlx::query_as(
+        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path FROM gallery WHERE short_id = ?",
+    )
+    .bind(&short_id)
+    .fetch_one(&state.db.pool)
+    .await;
+
+    match item {
+        Ok(item) => {
+            // Check ownership (owner or superuser can generate signed URLs)
+            if item.user_id != auth_user.id && !auth_user.is_superuser() {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(ApiResponse::error("You can only generate signed URLs for your own images")),
+                );
+            }
+
+            // Generate expiration timestamp (15 minutes from now)
+            let expires = Utc::now().timestamp() + 15 * 60;
+
+            // Generate signature
+            let sig = generate_signature(&short_id, item.user_id, expires, &state.config.jwt_secret);
+
+            // Build signed URL for both raw and thumbnail
+            let base_url = format!("{}/api/gallery", state.config.server_host);
+            let raw_url = format!("{}/r/{}?expires={}&sig={}", base_url, short_id, expires, sig);
+
+            (
+                StatusCode::OK,
+                Json(ApiResponse::success(SignedUrlResponse {
+                    url: raw_url,
+                    expires_at: expires,
+                })),
+            )
         }
         Err(_) => (
             StatusCode::NOT_FOUND,

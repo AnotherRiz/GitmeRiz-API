@@ -60,7 +60,7 @@ src/
 2. Copy `.env.example` to `.env` and update the values:
    ```
    DATABASE_URL=mysql://user:password@localhost:3306/gitmeriz
-   SERVER_HOST=127.0.0.1
+   SERVER_HOST=localhost
    SERVER_PORT=3000
    JWT_SECRET=your-super-secret-jwt-key-change-in-production
    ```
@@ -76,76 +76,76 @@ src/
    cargo run
    ```
 
-The server will start at `http://127.0.0.1:3000`. All tables are created automatically on startup.
+The server will start at `http://localhost:3000`. All tables are created automatically on startup.
 
 ## API Endpoints
 
 ### Public (No Auth Required)
 - `GET /health` — Health check
-- `POST /api/register` — Register a new user (default role: `user`)
-- `POST /api/login` — Login and receive JWT token
+- `POST /register` — Register a new user (default role: `user`)
+- `POST /login` — Login and receive JWT token
 
 ### Protected (Auth Required)
 All protected endpoints require the `Authorization: Bearer <token>` header.
 
 #### Users
-- `GET /api/users/me` — Get current user
-- `GET /api/users` — List all users (superuser only)
-- `GET /api/users/:id` — Get user by ID
-- `PUT /api/users/:id` — Update user
-- `DELETE /api/users/:id` — Delete user (superuser only)
+- `GET /users/me` — Get current user
+- `GET /users` — List all users (superuser only)
+- `GET /users/:id` — Get user by ID
+- `PUT /users/:id` — Update user
+- `DELETE /users/:id` — Delete user (superuser only)
 
 #### Gallery (Images)
-- `GET /api/gallery` — List images (own images, or all for superuser)
-- `POST /api/gallery` — Upload image
-- `GET /api/gallery/:id` — Get image
-- `DELETE /api/gallery/:id` — Delete image
+- `GET /gallery` — List images (own images, or all for superuser)
+- `POST /gallery` — Upload image
+- `GET /gallery/:id` — Get image
+- `DELETE /gallery/:id` — Delete image
 
 #### Video
-- `GET /api/video` — List videos (own videos, or all for superuser)
-- `POST /api/video` — Upload video
-- `GET /api/video/:id` — Get video
-- `DELETE /api/video/:id` — Delete video
+- `GET /video` — List videos (own videos, or all for superuser)
+- `POST /video` — Upload video
+- `GET /video/:id` — Get video
+- `DELETE /video/:id` — Delete video
 
 #### Audio
-- `GET /api/audio` — List audio (own audio, or all for superuser)
-- `POST /api/audio` — Upload audio
-- `GET /api/audio/:id` — Get audio
-- `DELETE /api/audio/:id` — Delete audio
+- `GET /audio` — List audio (own audio, or all for superuser)
+- `POST /audio` — Upload audio
+- `GET /audio/:id` — Get audio
+- `DELETE /audio/:id` — Delete audio
 
 #### Blog
-- `GET /api/blog` — List published posts (all roles)
-- `POST /api/blog` — Create post (admin/superuser only)
-- `GET /api/blog/:id` — Get post
-- `PUT /api/blog/:id` — Update post (admin/superuser only)
-- `DELETE /api/blog/:id` — Delete post (admin/superuser only)
+- `GET /blog` — List published posts (all roles)
+- `POST /blog` — Create post (admin/superuser only)
+- `GET /blog/:id` — Get post
+- `PUT /blog/:id` — Update post (admin/superuser only)
+- `DELETE /blog/:id` — Delete post (admin/superuser only)
 
 #### Notes
-- `GET /api/notes` — List own notes
-- `POST /api/notes` — Create note
-- `GET /api/notes/:id` — Get note
-- `PUT /api/notes/:id` — Update note
-- `DELETE /api/notes/:id` — Delete note
+- `GET /notes` — List own notes
+- `POST /notes` — Create note
+- `GET /notes/:id` — Get note
+- `PUT /notes/:id` — Update note
+- `DELETE /notes/:id` — Delete note
 
 #### Clipboard
-- `GET /api/clipboard` — List own clipboard items
-- `POST /api/clipboard` — Create clipboard item
-- `GET /api/clipboard/:id` — Get clipboard item
-- `PUT /api/clipboard/:id` — Update clipboard item
-- `DELETE /api/clipboard/:id` — Delete clipboard item
+- `GET /clipboard` — List own clipboard items
+- `POST /clipboard` — Create clipboard item
+- `GET /clipboard/:id` — Get clipboard item
+- `PUT /clipboard/:id` — Update clipboard item
+- `DELETE /clipboard/:id` — Delete clipboard item
 
 ## Request/Response Examples
 
 ### Register
 ```bash
-curl -X POST http://127.0.0.1:3000/api/register \
+curl -X POST http://localhost:3000/register \
   -H "Content-Type: application/json" \
   -d '{"name":"John","username":"john","email":"john@example.com","password":"secret123"}'
 ```
 
 ### Login
 ```bash
-curl -X POST http://127.0.0.1:3000/api/login \
+curl -X POST http://localhost:3000/login \
   -H "Content-Type: application/json" \
   -d '{"username":"john","password":"secret123"}'
 ```
@@ -170,7 +170,7 @@ Response:
 
 ### Using Protected Endpoints
 ```bash
-curl http://127.0.0.1:3000/api/users/me \
+curl http://localhost:3000/users/me \
   -H "Authorization: Bearer <your-token>"
 ```
 
@@ -195,3 +195,4 @@ Or on error:
 - `401 Unauthorized` — Missing or invalid token
 - `403 Forbidden` — Insufficient permissions for the action
 - `404 Not Found` — Resource not found
+
