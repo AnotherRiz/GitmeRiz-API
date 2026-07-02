@@ -18,16 +18,23 @@ pub fn accepts_html(headers: &HeaderMap) -> bool {
 /// Generate an HTML error page
 fn generate_html_error_page(status_code: StatusCode, message: &str, frontend_url: &str) -> String {
     let status_num = status_code.as_u16();
-    let title = match status_code {
-        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
-            format!("{} | Unauthorized access to this image.", status_num)
-        }
-        StatusCode::NOT_FOUND => {
-            format!("{} | Image not found.", status_num)
-        }
-        _ => {
-            format!("{} | Error", status_num)
-        }
+    let (heading, description) = match status_code {
+        StatusCode::UNAUTHORIZED => (
+            "Unauthorized Access",
+            "You need to be logged in to view this image."
+        ),
+        StatusCode::FORBIDDEN => (
+            "Access Denied",
+            "You don't have permission to access this image."
+        ),
+        StatusCode::NOT_FOUND => (
+            "Image Not Found",
+            "The image you're looking for doesn't exist or has been removed."
+        ),
+        _ => (
+            "Error",
+            "An error occurred while processing your request."
+        )
     };
 
     format!(
@@ -36,7 +43,10 @@ fn generate_html_error_page(status_code: StatusCode, message: &str, frontend_url
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{}</title>
+    <title>{} - GitmeRiz</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&display=swap" rel="stylesheet">
     <style>
         * {{
             margin: 0;
@@ -44,78 +54,115 @@ fn generate_html_error_page(status_code: StatusCode, message: &str, frontend_url
             box-sizing: border-box;
         }}
         body {{
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
-            background: linear-gradient(135deg, #1e3c72 0%, #2a5298 100%);
-            color: #ffffff;
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            background: #19161D;
+            color: #FAFAFA;
             display: flex;
             align-items: center;
             justify-content: center;
             min-height: 100vh;
             padding: 20px;
-        }}
-        .container {{
-            text-align: center;
-            max-width: 600px;
-            background: rgba(255, 255, 255, 0.1);
-            backdrop-filter: blur(10px);
-            border-radius: 20px;
-            padding: 60px 40px;
-            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
-        }}
-        h1 {{
-            font-size: 3rem;
-            font-weight: 700;
-            margin-bottom: 20px;
-            line-height: 1.2;
-        }}
-        .status-code {{
-            font-size: 6rem;
-            font-weight: 900;
-            color: rgba(255, 255, 255, 0.9);
-            margin-bottom: 10px;
-        }}
-        p {{
-            font-size: 1.2rem;
-            margin-bottom: 40px;
-            color: rgba(255, 255, 255, 0.9);
             line-height: 1.6;
         }}
-        .btn {{
+        .error-container {{
+            text-align: center;
+            max-width: 600px;
+            width: 100%;
+        }}
+        .error-code {{
+            font-size: 8rem;
+            font-weight: 800;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            margin-bottom: 1rem;
+            line-height: 1;
+        }}
+        .error-heading {{
+            font-size: 2rem;
+            font-weight: 700;
+            color: #FAFAFA;
+            margin-bottom: 1rem;
+        }}
+        .error-description {{
+            font-size: 1.125rem;
+            color: #a0a0a0;
+            margin-bottom: 2rem;
+            line-height: 1.7;
+        }}
+        .error-message {{
+            background: #211D27;
+            border: 1px solid #2a2630;
+            border-radius: 8px;
+            padding: 1rem 1.5rem;
+            margin-bottom: 2rem;
+            color: #b0b0b0;
+            font-size: 0.9rem;
+        }}
+        .btn-home {{
             display: inline-block;
-            padding: 14px 40px;
-            background: #ffffff;
-            color: #1e3c72;
+            padding: 12px 32px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: #FAFAFA;
             text-decoration: none;
-            border-radius: 50px;
+            border-radius: 8px;
             font-weight: 600;
             font-size: 1rem;
-            transition: all 0.3s ease;
-            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.2);
+            transition: all 0.2s ease;
+            box-shadow: 0 4px 14px 0 rgba(102, 126, 234, 0.4);
         }}
-        .btn:hover {{
-            background: #f0f0f0;
+        .btn-home:hover {{
             transform: translateY(-2px);
-            box-shadow: 0 6px 20px rgba(0, 0, 0, 0.3);
+            box-shadow: 0 6px 20px 0 rgba(102, 126, 234, 0.5);
         }}
-        .error-details {{
-            margin-top: 30px;
-            font-size: 0.9rem;
-            color: rgba(255, 255, 255, 0.7);
+        .btn-home:active {{
+            transform: translateY(0);
+        }}
+        @media (max-width: 640px) {{
+            .error-code {{
+                font-size: 5rem;
+            }}
+            .error-heading {{
+                font-size: 1.5rem;
+            }}
+            .error-description {{
+                font-size: 1rem;
+            }}
+        }}
+        @media (prefers-color-scheme: light) {{
+            body {{
+                background: #F4F3F6;
+                color: #0F0F0F;
+            }}
+            .error-heading {{
+                color: #0F0F0F;
+            }}
+            .error-message {{
+                background: #dfdee6;
+                border: 1px solid #d0cfd6;
+                color: #4a4a4a;
+            }}
+            .btn-home {{
+                color: #FAFAFA;
+            }}
         }}
     </style>
 </head>
 <body>
-    <div class="container">
-        <div class="status-code">{}</div>
-        <h1>{}</h1>
-        <p>{}</p>
-        <a href="{}" class="btn">Back to Home</a>
+    <div class="error-container">
+        <div class="error-code">{}</div>
+        <h1 class="error-heading">{}</h1>
+        <p class="error-description">{}</p>
+        <div class="error-message">{}</div>
+        <a href="{}" class="btn-home">← Back to Home</a>
     </div>
 </body>
 </html>"#,
-        title,
+        heading,
         status_num,
-        title,
+        heading,
+        description,
         message,
         frontend_url
     )
