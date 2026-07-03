@@ -23,7 +23,7 @@ use crate::media::{
 use crate::models::{ApiResponse, AuthUser};
 use crate::AppState;
 
-#[derive(Debug, FromRow, Serialize)]
+#[derive(Debug, FromRow, Serialize, Clone)]
 pub struct GalleryItem {
     pub id: i32,
     pub user_id: i32,
@@ -83,16 +83,6 @@ struct ImageQuery {
 struct SignedUrlResponse {
     url: String,
     expires_at: i64,
-}
-
-// Helper struct for parallel processing
-struct FileProcessData {
-    stored_path: String,
-    orig_filename: String,
-    item_title: String,
-    file_bytes: Vec<u8>,
-    mime_type: String,
-    size_bytes: i64,
 }
 
 /// Generate HMAC-SHA256 signature for signed URL
@@ -248,7 +238,9 @@ async fn list_my_gallery(
     }
 }
 
-// POST /api/gallery - Upload image (multipart/form-data)
+// POST /api/gallery - Upload image with BACKGROUND PROCESSING (multipart/form-data)
+// Returns 202 Accepted immediately after saving raw files
+// Processing (thumbnail/preview generation) happens in detached background task
 async fn upload_image(
     Extension(auth_user): Extension<AuthUser>,
     State(state): State<Arc<AppState>>,
@@ -307,42 +299,48 @@ async fn upload_image(
         );
     }
 
-    tracing::info!(%batch_id, file_count = files.len(), "Starting bulk upload");
+    tracing::info!(%batch_id, file_count = files.len(), "Starting upload with background processing");
 
     // First pass: Validation
     for (orig_filename, file_bytes) in &files {
-        // Validate extension
         if let Err(msg) = validate_extension(MediaType::Gallery, orig_filename) {
             return (StatusCode::BAD_REQUEST, Json(ApiResponse::error(msg)));
         }
 
-        // Validate size (100 MB max for images)
         let size_bytes = file_bytes.len() as u64;
         if let Err(msg) = validate_size(MediaType::Gallery, size_bytes) {
-            return (
-                StatusCode::PAYLOAD_TOO_LARGE,
-                Json(ApiResponse::error(msg)),
-            );
+            return (StatusCode::PAYLOAD_TOO_LARGE, Json(ApiResponse::error(msg)));
         }
     }
 
     let num_files = files.len();
 
-    // Phase 1: Save raw files to disk and prepare data
-    let mut file_data: Vec<FileProcessData> = Vec::new();
-    for (orig_filename, file_bytes) in files {
-        let extension = get_extension(&orig_filename).unwrap_or_default();
+    // ============================================================================
+    // PHASE 1: FAST UPLOAD - Save raw files and insert DB (< 200ms)
+    // ============================================================================
+    
+    let mut uploaded_items: Vec<GalleryItem> = Vec::new();
+    let mut tx = match state.db.pool.begin().await {
+        Ok(tx) => tx,
+        Err(e) => {
+            tracing::error!("Failed to start transaction: {:?}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::error("Failed to start database transaction")),
+            );
+        }
+    };
 
-        // Generate storage path
+    for (orig_filename, file_bytes) in &files {
+        let extension = get_extension(orig_filename).unwrap_or_default();
         let (stored_path, full_path) =
             generate_storage_path(&state.config.storage_dir, MediaType::Gallery, &extension);
 
-        // Save file to disk
-        if let Err(e) = save_file(&full_path, &file_bytes).await {
+        // Save raw file to disk
+        if let Err(e) = save_file(&full_path, file_bytes).await {
             tracing::error!("Failed to save file {}: {}", orig_filename, e);
-            // Clean up any files already saved
-            for data in &file_data {
-                let _ = delete_file(&state.config.storage_dir, &data.stored_path).await;
+            for item in &uploaded_items {
+                let _ = delete_file(&state.config.storage_dir, &item.stored_path).await;
             }
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -352,188 +350,13 @@ async fn upload_image(
 
         let mime_type = MediaType::Gallery.mime_type_for_extension(&extension);
         let size_bytes = file_bytes.len() as i64;
-        
-        // Determine title
         let item_title = if num_files == 1 && title.is_some() {
             title.clone().unwrap()
         } else {
             orig_filename.clone()
         };
 
-        file_data.push(FileProcessData {
-            stored_path,
-            orig_filename,
-            item_title,
-            file_bytes,
-            mime_type: mime_type.to_string(),
-            size_bytes,
-        });
-    }
-
-    // Phase 2: Generate thumbnails and previews in parallel with semaphore (memory ceiling)
-    // OPTIMIZED: Single decode per image, cascading resize (2x faster, 50% less memory)
-    let mut processing_tasks = Vec::new();
-    
-    for (index, data) in file_data.iter().enumerate() {
-        let semaphore = state.image_semaphore.clone();
-        let bytes = data.file_bytes.clone();
-        let path = data.stored_path.clone();
-        let filename = data.orig_filename.clone();
-        let image_id = Uuid::new_v4();
-
-        let task = tokio::spawn(
-            async move {
-                tracing::info!("Starting image processing (single decode + cascading resize)");
-                
-                // Wait here if too many images are already decoding (memory ceiling)
-                let _permit = semaphore.acquire_owned().await
-                    .map_err(|_| "semaphore closed".to_string())?;
-
-                tracing::debug!("Semaphore permit acquired, processing image");
-
-                // SINGLE SPAWN_BLOCKING: Decode once, generate both thumb + preview
-                // This is ~2x faster and uses ~50% less memory than double decode
-                let result = tokio::task::spawn_blocking(move || {
-                    generate_thumbnail_and_preview(&bytes)
-                })
-                .await
-                .map_err(|e| {
-                    tracing::error!("Processing task panicked: {}", e);
-                    format!("processing task panicked: {}", e)
-                })?;
-
-                let thumbnail_path = generate_thumbnail_path(&path);
-                let preview_path = generate_preview_path(&path);
-                
-                match result {
-                    Ok((thumb_bytes, preview_bytes)) => {
-                        tracing::info!("Thumbnail and preview encoded successfully");
-                        Ok::<(usize, String, String, Vec<u8>, Vec<u8>), String>((
-                            index,
-                            thumbnail_path,
-                            preview_path,
-                            thumb_bytes,
-                            preview_bytes,
-                        ))
-                    }
-                    Err(e) => {
-                        tracing::error!("Image processing failed: {}", e);
-                        Err(e)
-                    }
-                }
-                // _permit is dropped here, releasing the slot for the next image
-            }
-            .instrument(tracing::info_span!("process_image", %batch_id, %image_id, %filename))
-        );
-
-        processing_tasks.push(task);
-    }
-
-    // Collect all processing results
-    let processing_results = futures::future::join_all(processing_tasks).await;
-    
-    let success_count = processing_results.iter().filter(|r| matches!(r, Ok(Ok(_)))).count();
-    let fail_count = processing_results.len() - success_count;
-    tracing::info!(%batch_id, succeeded = success_count, failed = fail_count, "Image processing completed");
-
-    // Phase 3: Save thumbnails and previews in parallel, then insert into database
-    
-    // Phase 3.1: Parallel Disk I/O - Save all thumbnail and preview files concurrently
-    tracing::info!(%batch_id, "Starting parallel disk I/O for thumbnails and previews");
-    
-    let mut save_tasks = Vec::new();
-    
-    for (idx, result) in processing_results.iter().enumerate() {
-        if let Ok(Ok((_, thumb_path, prev_path, thumb_bytes, preview_bytes))) = result {
-            let storage_dir = state.config.storage_dir.clone();
-            let thumb_path_clone = thumb_path.clone();
-            let prev_path_clone = prev_path.clone();
-            let thumb_bytes_clone = thumb_bytes.clone();
-            let preview_bytes_clone = preview_bytes.clone();
-            let orig_filename = file_data[idx].orig_filename.clone();
-            
-            // Spawn task to save both thumbnail and preview for this image
-            let save_task = tokio::spawn(async move {
-                let mut results = (None, None);
-                
-                // Save thumbnail
-                let thumbnail_full_path = std::path::PathBuf::from(&storage_dir).join(&thumb_path_clone);
-                match save_file(&thumbnail_full_path, &thumb_bytes_clone).await {
-                    Ok(_) => results.0 = Some(thumb_path_clone.clone()),
-                    Err(e) => {
-                        tracing::warn!("Failed to save thumbnail for {}: {}", orig_filename, e);
-                    }
-                }
-                
-                // Save preview
-                let preview_full_path = std::path::PathBuf::from(&storage_dir).join(&prev_path_clone);
-                match save_file(&preview_full_path, &preview_bytes_clone).await {
-                    Ok(_) => results.1 = Some(prev_path_clone.clone()),
-                    Err(e) => {
-                        tracing::warn!("Failed to save preview for {}: {}", orig_filename, e);
-                    }
-                }
-                
-                (idx, results)
-            });
-            
-            save_tasks.push(save_task);
-        }
-    }
-    
-    // Wait for all disk I/O operations to complete
-    let save_results = futures::future::join_all(save_tasks).await;
-    
-    // Build a map of index -> (thumbnail_path, preview_path)
-    let mut saved_paths: std::collections::HashMap<usize, (Option<String>, Option<String>)> = std::collections::HashMap::new();
-    for result in save_results {
-        match result {
-            Ok((idx, (thumb_path, prev_path))) => {
-                saved_paths.insert(idx, (thumb_path, prev_path));
-            }
-            Err(e) => {
-                tracing::warn!("Disk I/O task failed: {}", e);
-            }
-        }
-    }
-    
-    tracing::info!(%batch_id, saved_files = saved_paths.len() * 2, "Parallel disk I/O completed");
-    
-    // Phase 3.2: Insert into database
-    let mut uploaded_items = Vec::new();
-    let mut tx = match state.db.pool.begin().await {
-        Ok(tx) => tx,
-        Err(e) => {
-            tracing::error!("Failed to start transaction: {:?}", e);
-            // Clean up saved files
-            for data in &file_data {
-                let _ = delete_file(&state.config.storage_dir, &data.stored_path).await;
-            }
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiResponse::error("Failed to start database transaction")),
-            );
-        }
-    };
-
-    for (idx, data) in file_data.into_iter().enumerate() {
-        // Get saved paths from the parallel I/O results
-        let (thumbnail_path, preview_path) = match &processing_results[idx] {
-            Ok(Ok(_)) => {
-                // Check if files were saved successfully
-                saved_paths.get(&idx).cloned().unwrap_or((None, None))
-            }
-            Ok(Err(e)) => {
-                tracing::warn!("Processing failed for {}: {}", data.orig_filename, e);
-                (None, None)
-            }
-            Err(e) => {
-                tracing::warn!("Processing task failed for {}: {}", data.orig_filename, e);
-                (None, None)
-            }
-        };
-
-        // Generate unique short_id with collision retry
+        // Generate unique short_id
         let short_id = loop {
             let candidate = generate_short_id();
             let exists: Result<Option<(i32,)>, _> = sqlx::query_as(
@@ -548,11 +371,10 @@ async fn upload_image(
                 Ok(Some(_)) => continue,
                 Err(e) => {
                     tracing::error!("Failed to check short_id uniqueness: {}", e);
-                    // Clean up all saved files
-                    let _ = delete_file(&state.config.storage_dir, &data.stored_path).await;
-                    if let Some(ref thumb_path) = thumbnail_path {
-                        let _ = delete_file(&state.config.storage_dir, thumb_path).await;
+                    for item in &uploaded_items {
+                        let _ = delete_file(&state.config.storage_dir, &item.stored_path).await;
                     }
+                    let _ = delete_file(&state.config.storage_dir, &stored_path).await;
                     return (
                         StatusCode::INTERNAL_SERVER_ERROR,
                         Json(ApiResponse::error("Failed to generate unique short_id")),
@@ -561,20 +383,19 @@ async fn upload_image(
             }
         };
 
-        // Insert into database
+        // Insert with status='processing' (thumbnail/preview NULL)
         let result = sqlx::query(
-            "INSERT INTO gallery (user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, preview_path) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO gallery (user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, status) 
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'processing')",
         )
         .bind(auth_user.id)
-        .bind(&data.item_title)
-        .bind(&data.orig_filename)
-        .bind(&data.stored_path)
-        .bind(data.size_bytes)
-        .bind(&data.mime_type)
+        .bind(&item_title)
+        .bind(&orig_filename)
+        .bind(&stored_path)
+        .bind(size_bytes)
+        .bind(&mime_type)
         .bind(&visibility)
         .bind(&short_id)
-        .bind(&thumbnail_path)
-        .bind(&preview_path)
         .execute(&mut *tx)
         .await;
 
@@ -583,29 +404,25 @@ async fn upload_image(
                 uploaded_items.push(GalleryItem {
                     id: res.last_insert_id() as i32,
                     user_id: auth_user.id,
-                    title: data.item_title,
-                    original_filename: data.orig_filename,
-                    stored_path: data.stored_path,
-                    size_bytes: data.size_bytes,
-                    mime_type: data.mime_type,
+                    title: item_title,
+                    original_filename: orig_filename.clone(),
+                    stored_path,
+                    size_bytes,
+                    mime_type: mime_type.to_string(),
                     visibility: visibility.clone(),
                     short_id,
-                    thumbnail_path,
-                    preview_path,
+                    thumbnail_path: None,  // Generated in background
+                    preview_path: None,    // Generated in background
                     pinned: false,
-                    status: "active".to_string(),
+                    status: "processing".to_string(),
                 });
             }
             Err(e) => {
                 tracing::error!("Failed to insert gallery item: {}", e);
-                // Clean up the files
-                let _ = delete_file(&state.config.storage_dir, &data.stored_path).await;
-                if let Some(ref thumb_path) = thumbnail_path {
-                    let _ = delete_file(&state.config.storage_dir, thumb_path).await;
+                for item in &uploaded_items {
+                    let _ = delete_file(&state.config.storage_dir, &item.stored_path).await;
                 }
-                if let Some(ref prev_path) = preview_path {
-                    let _ = delete_file(&state.config.storage_dir, prev_path).await;
-                }
+                let _ = delete_file(&state.config.storage_dir, &stored_path).await;
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(ApiResponse::error("Failed to save image metadata")),
@@ -614,7 +431,6 @@ async fn upload_image(
         }
     }
 
-    // Commit the transaction
     if let Err(e) = tx.commit().await {
         tracing::error!("Failed to commit database transaction: {}", e);
         return (
@@ -623,13 +439,155 @@ async fn upload_image(
         );
     }
 
-    tracing::info!(%batch_id, total_uploaded = uploaded_items.len(), "Bulk upload finished");
+    tracing::info!(%batch_id, total_uploaded = uploaded_items.len(), "Raw files saved, spawning background processing");
+
+    // ============================================================================
+    // PHASE 2: SPAWN DETACHED BACKGROUND TASK (does NOT block HTTP response!)
+    // ============================================================================
+    
+    let db_pool = state.db.pool.clone();
+    let storage_dir = state.config.storage_dir.clone();
+    let semaphore = state.image_semaphore.clone();
+    let items_to_process = uploaded_items.clone();
+
+    tokio::spawn(async move {
+        tracing::info!(%batch_id, "Background processing started");
+        
+        let mut processing_tasks = Vec::new();
+
+        for item in &items_to_process {
+            let semaphore = semaphore.clone();
+            let storage_dir = storage_dir.clone();
+            let stored_path = item.stored_path.clone();
+            let item_id = item.id;
+            let image_id = Uuid::new_v4();
+            let filename = item.original_filename.clone();
+
+            let task = tokio::spawn(
+                async move {
+                    // Read raw file
+                    let file_bytes = match read_file(&storage_dir, &stored_path).await {
+                        Ok(bytes) => bytes,
+                        Err(e) => {
+                            tracing::error!("Failed to read raw file: {}", e);
+                            return Err(format!("Failed to read file: {}", e));
+                        }
+                    };
+
+                    // Acquire semaphore (memory ceiling)
+                    let _permit = semaphore.acquire_owned().await
+                        .map_err(|_| "semaphore closed".to_string())?;
+
+                    // Generate thumbnail + preview (single decode)
+                    let result = tokio::task::spawn_blocking(move || {
+                        generate_thumbnail_and_preview(&file_bytes)
+                    })
+                    .await
+                    .map_err(|e| format!("spawn_blocking panicked: {}", e))?;
+
+                    let thumbnail_path = generate_thumbnail_path(&stored_path);
+                    let preview_path = generate_preview_path(&stored_path);
+                    
+                    match result {
+                        Ok((thumb_bytes, preview_bytes)) => {
+                            Ok((item_id, thumbnail_path, preview_path, thumb_bytes, preview_bytes))
+                        }
+                        Err(e) => Err(e)
+                    }
+                }
+                .instrument(tracing::info_span!("bg_process", %batch_id, %image_id, %filename))
+            );
+
+            processing_tasks.push(task);
+        }
+
+        let processing_results = futures::future::join_all(processing_tasks).await;
+        
+        let success_count = processing_results.iter().filter(|r| matches!(r, Ok(Ok(_)))).count();
+        let fail_count = processing_results.len() - success_count;
+        tracing::info!(%batch_id, succeeded = success_count, failed = fail_count, "Processing completed");
+
+        // Save files in parallel
+        let mut save_tasks = Vec::new();
+        
+        for result in &processing_results {
+            if let Ok(Ok((item_id, thumb_path, prev_path, thumb_bytes, preview_bytes))) = result {
+                let storage_dir = storage_dir.clone();
+                let thumb_path = thumb_path.clone();
+                let prev_path = prev_path.clone();
+                let thumb_bytes = thumb_bytes.clone();
+                let preview_bytes = preview_bytes.clone();
+                let item_id = *item_id;
+                
+                let save_task = tokio::spawn(async move {
+                    let thumbnail_full_path = std::path::PathBuf::from(&storage_dir).join(&thumb_path);
+                    let preview_full_path = std::path::PathBuf::from(&storage_dir).join(&prev_path);
+                    
+                    let thumb_result = save_file(&thumbnail_full_path, &thumb_bytes).await;
+                    let preview_result = save_file(&preview_full_path, &preview_bytes).await;
+                    
+                    let final_thumb = if thumb_result.is_ok() { Some(thumb_path) } else { None };
+                    let final_preview = if preview_result.is_ok() { Some(prev_path) } else { None };
+                    
+                    (item_id, final_thumb, final_preview)
+                });
+                
+                save_tasks.push(save_task);
+            }
+        }
+        
+        let save_results = futures::future::join_all(save_tasks).await;
+        
+        // Update database
+        for result in save_results {
+            if let Ok((item_id, thumb_path, prev_path)) = result {
+                if thumb_path.is_some() || prev_path.is_some() {
+                    let _ = sqlx::query(
+                        "UPDATE gallery SET status = 'active', thumbnail_path = ?, preview_path = ? WHERE id = ?"
+                    )
+                    .bind(&thumb_path)
+                    .bind(&prev_path)
+                    .bind(item_id)
+                    .execute(&db_pool)
+                    .await;
+                    
+                    tracing::info!(%batch_id, item_id, "Successfully activated");
+                } else {
+                    let _ = sqlx::query("UPDATE gallery SET status = 'failed_processing' WHERE id = ?")
+                        .bind(item_id)
+                        .execute(&db_pool)
+                        .await;
+                    
+                    tracing::error!(%batch_id, item_id, "Failed to save files");
+                }
+            }
+        }
+
+        // Mark failed processing
+        for (idx, result) in processing_results.iter().enumerate() {
+            if matches!(result, Ok(Err(_)) | Err(_)) {
+                let item_id = items_to_process[idx].id;
+                let _ = sqlx::query("UPDATE gallery SET status = 'failed_processing' WHERE id = ?")
+                    .bind(item_id)
+                    .execute(&db_pool)
+                    .await;
+            }
+        }
+        
+        tracing::info!(%batch_id, "Background processing fully completed");
+    });
+
+    // ============================================================================
+    // PHASE 3: RETURN 202 ACCEPTED IMMEDIATELY (User doesn't wait!)
+    // ============================================================================
+    
+    tracing::info!(%batch_id, "Returning 202 Accepted (processing continues in background)");
 
     if num_files == 1 {
         let single_item = uploaded_items.into_iter().next().unwrap();
-        (StatusCode::CREATED, Json(ApiResponse::success(UploadResponse::Single(single_item))))
+        (StatusCode::ACCEPTED, Json(ApiResponse::success(UploadResponse::Single(single_item))))
     } else {
-        (StatusCode::CREATED, Json(ApiResponse::success(UploadResponse::Bulk(uploaded_items))))
+        (StatusCode::ACCEPTED, Json(ApiResponse::success(UploadResponse::Bulk(uploaded_items))))
     }
 }
 
