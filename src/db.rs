@@ -190,6 +190,24 @@ impl Database {
             tracing::info!("Gallery status column added successfully");
         }
 
+        // Check if gallery table is missing 'preview_path' column
+        let has_preview_path = match sqlx::query("SHOW COLUMNS FROM gallery LIKE 'preview_path'")
+            .fetch_optional(&self.pool)
+            .await
+        {
+            Ok(Some(_)) => true,
+            _ => false,
+        };
+
+        if !has_preview_path {
+            tracing::info!("Adding preview_path column to gallery table");
+            sqlx::query("ALTER TABLE gallery ADD COLUMN preview_path VARCHAR(512)")
+                .execute(&self.pool)
+                .await?;
+            
+            tracing::info!("Gallery preview_path column added successfully");
+        }
+
         // Create videos table with file storage columns
         sqlx::query(
             r#"

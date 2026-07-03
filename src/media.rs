@@ -213,6 +213,21 @@ pub fn generate_thumbnail_path(original_stored_path: &str) -> String {
     format!("{}-thumb.webp", path_without_ext)
 }
 
+/// Generate preview path from original stored path
+/// Converts: gallery/2026/07/2026-07-01/2026-07-01_15-15-01_UUID.png
+/// To:       gallery/2026/07/2026-07-01/2026-07-01_15-15-01_UUID-preview.webp
+pub fn generate_preview_path(original_stored_path: &str) -> String {
+    // Remove extension from original path
+    let path_without_ext = if let Some(pos) = original_stored_path.rfind('.') {
+        &original_stored_path[..pos]
+    } else {
+        original_stored_path
+    };
+    
+    // Append -preview.webp
+    format!("{}-preview.webp", path_without_ext)
+}
+
 /// Generate thumbnail from image bytes
 /// - Max width: 500px (proportional resize, aspect ratio maintained)
 /// - Format: WebP lossy with quality 80

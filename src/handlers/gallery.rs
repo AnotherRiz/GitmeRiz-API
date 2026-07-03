@@ -17,8 +17,8 @@ use crate::auth::validate_token;
 use crate::error_page::build_error_response;
 use crate::media::{
     delete_file, generate_storage_path, read_file, save_file, validate_extension, validate_size,
-    get_extension, generate_short_id, generate_thumbnail_path, generate_and_encode_thumbnail, 
-    generate_and_encode_preview, MediaType,
+    get_extension, generate_short_id, generate_thumbnail_path, generate_preview_path,
+    generate_and_encode_thumbnail, generate_and_encode_preview, MediaType,
 };
 use crate::models::{ApiResponse, AuthUser};
 use crate::AppState;
@@ -36,6 +36,8 @@ pub struct GalleryItem {
     pub short_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thumbnail_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preview_path: Option<String>,
     pub pinned: bool,
     pub status: String,
 }
@@ -198,7 +200,7 @@ async fn list_gallery(
     State(state): State<Arc<AppState>>,
 ) -> (StatusCode, Json<ApiResponse<Vec<GalleryItem>>>) {
     let items: Result<Vec<GalleryItem>, _> = sqlx::query_as(
-        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, pinned, status FROM gallery WHERE visibility = 'public' ORDER BY id DESC",
+        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, preview_path, pinned, status FROM gallery WHERE visibility = 'public' ORDER BY id DESC",
     )
     .fetch_all(&state.db.pool)
     .await;
@@ -221,7 +223,7 @@ async fn list_my_gallery(
     State(state): State<Arc<AppState>>,
 ) -> (StatusCode, Json<ApiResponse<Vec<GalleryItem>>>) {
     let items: Result<Vec<GalleryItem>, _> = sqlx::query_as(
-        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, pinned, status FROM gallery WHERE user_id = ? ORDER BY id DESC",
+        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, preview_path, pinned, status FROM gallery WHERE user_id = ? ORDER BY id DESC",
     )
     .bind(auth_user.id)
     .fetch_all(&state.db.pool)
@@ -361,8 +363,8 @@ async fn upload_image(
         });
     }
 
-    // Phase 2: Generate thumbnails in parallel with semaphore (memory ceiling)
-    let mut thumbnail_tasks = Vec::new();
+    // Phase 2: Generate thumbnails and previews in parallel with semaphore (memory ceiling)
+    let mut processing_tasks = Vec::new();
     
     for (index, data) in file_data.iter().enumerate() {
         let semaphore = state.image_semaphore.clone();
@@ -373,43 +375,69 @@ async fn upload_image(
 
         let task = tokio::spawn(
             async move {
-                tracing::info!("Starting thumbnail generation");
+                tracing::info!("Starting thumbnail and preview generation");
                 
                 // Wait here if too many images are already decoding (memory ceiling)
                 let _permit = semaphore.acquire_owned().await
                     .map_err(|_| "semaphore closed".to_string())?;
 
-                tracing::debug!("Semaphore permit acquired, decoding image");
+                tracing::debug!("Semaphore permit acquired, processing image");
 
-                // CPU-bound work goes on the blocking pool
-                let thumb = tokio::task::spawn_blocking(move || {
-                    generate_and_encode_thumbnail(&bytes, 500)
-                })
-                .await
-                .map_err(|e| {
-                    tracing::error!("Thumbnail task panicked: {}", e);
-                    format!("thumbnail task panicked: {}", e)
-                })??;
+                // Clone bytes for both thumbnail and preview
+                let bytes_for_thumb = bytes.clone();
+                let bytes_for_preview = bytes;
+
+                // Generate thumbnail (CPU-bound, use blocking pool)
+                let thumb_handle = tokio::task::spawn_blocking(move || {
+                    generate_and_encode_thumbnail(&bytes_for_thumb, 500)
+                });
+
+                // Generate preview (CPU-bound, use blocking pool)
+                let preview_handle = tokio::task::spawn_blocking(move || {
+                    generate_and_encode_preview(&bytes_for_preview, 1280)
+                });
+
+                // Wait for both to complete
+                let (thumb_result, preview_result) = tokio::join!(thumb_handle, preview_handle);
+
+                let thumb = thumb_result
+                    .map_err(|e| {
+                        tracing::error!("Thumbnail task panicked: {}", e);
+                        format!("thumbnail task panicked: {}", e)
+                    })?;
+
+                let preview = preview_result
+                    .map_err(|e| {
+                        tracing::error!("Preview task panicked: {}", e);
+                        format!("preview task panicked: {}", e)
+                    })?;
 
                 let thumbnail_path = generate_thumbnail_path(&path);
+                let preview_path = generate_preview_path(&path);
                 
-                tracing::info!("Thumbnail encoded successfully");
+                tracing::info!("Thumbnail and preview encoded successfully");
                 
-                Ok::<(usize, String, Vec<u8>), String>((index, thumbnail_path, thumb))
+                Ok::<(usize, String, String, Result<Vec<u8>, String>, Result<Vec<u8>, String>), String>((
+                    index,
+                    thumbnail_path,
+                    preview_path,
+                    thumb,
+                    preview,
+                ))
                 // _permit is dropped here, releasing the slot for the next image
             }
             .instrument(tracing::info_span!("process_image", %batch_id, %image_id, %filename))
         );
 
-        thumbnail_tasks.push(task);
+        processing_tasks.push(task);
     }
 
-    // Collect all thumbnail results
-    let thumbnail_results = futures::future::join_all(thumbnail_tasks).await;
+    // Collect all processing results
+    let processing_results = futures::future::join_all(processing_tasks).await;
     
-    let success_count = thumbnail_results.iter().filter(|r| matches!(r, Ok(Ok(_)))).count();
-    let fail_count = thumbnail_results.len() - success_count;
-    tracing::info!(%batch_id, succeeded = success_count, failed = fail_count, "Thumbnail generation completed");
+    let success_count = processing_results.iter().filter(|r| matches!(r, Ok(Ok(_)))).count();
+    let fail_count = processing_results.len() - success_count;
+    tracing::info!(%batch_id, succeeded = success_count, failed = fail_count, "Image processing completed");
 
     // Phase 3: Save thumbnails and insert into database
     let mut uploaded_items = Vec::new();
@@ -429,25 +457,47 @@ async fn upload_image(
     };
 
     for (idx, data) in file_data.into_iter().enumerate() {
-        // Handle thumbnail result
-        let thumbnail_path: Option<String> = match &thumbnail_results[idx] {
-            Ok(Ok((_, thumb_path, thumb_data))) => {
-                let thumbnail_full_path = std::path::PathBuf::from(&state.config.storage_dir).join(thumb_path);
-                match save_file(&thumbnail_full_path, thumb_data).await {
-                    Ok(_) => Some(thumb_path.clone()),
-                    Err(e) => {
-                        tracing::warn!("Failed to save thumbnail for {}: {}", data.orig_filename, e);
-                        None
+        // Handle thumbnail and preview results
+        let (thumbnail_path, preview_path) = match &processing_results[idx] {
+            Ok(Ok((_, thumb_path, prev_path, thumb_result, preview_result))) => {
+                let mut final_thumb_path = None;
+                let mut final_preview_path = None;
+
+                // Save thumbnail
+                if let Ok(thumb_data) = thumb_result {
+                    let thumbnail_full_path = std::path::PathBuf::from(&state.config.storage_dir).join(thumb_path);
+                    match save_file(&thumbnail_full_path, thumb_data).await {
+                        Ok(_) => final_thumb_path = Some(thumb_path.clone()),
+                        Err(e) => {
+                            tracing::warn!("Failed to save thumbnail for {}: {}", data.orig_filename, e);
+                        }
                     }
+                } else if let Err(e) = thumb_result {
+                    tracing::warn!("Failed to generate thumbnail for {}: {}", data.orig_filename, e);
                 }
+
+                // Save preview
+                if let Ok(preview_data) = preview_result {
+                    let preview_full_path = std::path::PathBuf::from(&state.config.storage_dir).join(prev_path);
+                    match save_file(&preview_full_path, preview_data).await {
+                        Ok(_) => final_preview_path = Some(prev_path.clone()),
+                        Err(e) => {
+                            tracing::warn!("Failed to save preview for {}: {}", data.orig_filename, e);
+                        }
+                    }
+                } else if let Err(e) = preview_result {
+                    tracing::warn!("Failed to generate preview for {}: {}", data.orig_filename, e);
+                }
+
+                (final_thumb_path, final_preview_path)
             }
             Ok(Err(e)) => {
-                tracing::warn!("Failed to generate thumbnail for {}: {}", data.orig_filename, e);
-                None
+                tracing::warn!("Processing failed for {}: {}", data.orig_filename, e);
+                (None, None)
             }
             Err(e) => {
-                tracing::warn!("Thumbnail task failed for {}: {}", data.orig_filename, e);
-                None
+                tracing::warn!("Processing task failed for {}: {}", data.orig_filename, e);
+                (None, None)
             }
         };
 
@@ -481,7 +531,7 @@ async fn upload_image(
 
         // Insert into database
         let result = sqlx::query(
-            "INSERT INTO gallery (user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO gallery (user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, preview_path) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(auth_user.id)
         .bind(&data.item_title)
@@ -492,6 +542,7 @@ async fn upload_image(
         .bind(&visibility)
         .bind(&short_id)
         .bind(&thumbnail_path)
+        .bind(&preview_path)
         .execute(&mut *tx)
         .await;
 
@@ -508,6 +559,7 @@ async fn upload_image(
                     visibility: visibility.clone(),
                     short_id,
                     thumbnail_path,
+                    preview_path,
                     pinned: false,
                     status: "active".to_string(),
                 });
@@ -518,6 +570,9 @@ async fn upload_image(
                 let _ = delete_file(&state.config.storage_dir, &data.stored_path).await;
                 if let Some(ref thumb_path) = thumbnail_path {
                     let _ = delete_file(&state.config.storage_dir, thumb_path).await;
+                }
+                if let Some(ref prev_path) = preview_path {
+                    let _ = delete_file(&state.config.storage_dir, prev_path).await;
                 }
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -552,7 +607,7 @@ async fn get_image(
     Path(id): Path<i32>,
 ) -> (StatusCode, Json<ApiResponse<GalleryItem>>) {
     let item: Result<GalleryItem, _> = sqlx::query_as(
-        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, pinned, status FROM gallery WHERE id = ?",
+        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, preview_path, pinned, status FROM gallery WHERE id = ?",
     )
     .bind(id)
     .fetch_one(&state.db.pool)
@@ -573,7 +628,7 @@ async fn download_image(
     Path(id): Path<i32>,
 ) -> impl IntoResponse {
     let item: Result<GalleryItem, _> = sqlx::query_as(
-        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, pinned, status FROM gallery WHERE id = ?",
+        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, preview_path, pinned, status FROM gallery WHERE id = ?",
     )
     .bind(id)
     .fetch_one(&state.db.pool)
@@ -624,7 +679,7 @@ async fn update_image_title(
     }
 
     let item: Result<GalleryItem, _> = sqlx::query_as(
-        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, pinned, status FROM gallery WHERE id = ?",
+        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, preview_path, pinned, status FROM gallery WHERE id = ?",
     )
     .bind(id)
     .fetch_one(&state.db.pool)
@@ -682,7 +737,7 @@ async fn update_image_visibility(
     }
 
     let item: Result<GalleryItem, _> = sqlx::query_as(
-        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, pinned, status FROM gallery WHERE id = ?",
+        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, preview_path, pinned, status FROM gallery WHERE id = ?",
     )
     .bind(id)
     .fetch_one(&state.db.pool)
@@ -731,7 +786,7 @@ async fn delete_image(
     Path(id): Path<i32>,
 ) -> (StatusCode, Json<ApiResponse<String>>) {
     let item: Result<GalleryItem, _> = sqlx::query_as(
-        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, pinned, status FROM gallery WHERE id = ?",
+        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, preview_path, pinned, status FROM gallery WHERE id = ?",
     )
     .bind(id)
     .fetch_one(&state.db.pool)
@@ -766,6 +821,13 @@ async fn delete_image(
                         }
                     }
                     
+                    // Delete preview from disk (if exists)
+                    if let Some(preview_path) = &item.preview_path {
+                        if let Err(e) = delete_file(&state.config.storage_dir, preview_path).await {
+                            tracing::warn!("Failed to delete preview from disk: {}", e);
+                        }
+                    }
+                    
                     (
                         StatusCode::OK,
                         Json(ApiResponse::success("Image deleted".to_string())),
@@ -793,7 +855,7 @@ async fn serve_raw_image(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let item: Result<GalleryItem, _> = sqlx::query_as(
-        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, pinned, status FROM gallery WHERE short_id = ?",
+        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, preview_path, pinned, status FROM gallery WHERE short_id = ?",
     )
     .bind(&short_id)
     .fetch_one(&state.db.pool)
@@ -890,7 +952,7 @@ async fn serve_thumbnail_image(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let item: Result<GalleryItem, _> = sqlx::query_as(
-        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, pinned, status FROM gallery WHERE short_id = ?",
+        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, preview_path, pinned, status FROM gallery WHERE short_id = ?",
     )
     .bind(&short_id)
     .fetch_one(&state.db.pool)
@@ -1000,7 +1062,7 @@ async fn generate_signed_url(
 ) -> (StatusCode, Json<ApiResponse<SignedUrlResponse>>) {
     // Fetch the image
     let item: Result<GalleryItem, _> = sqlx::query_as(
-        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, pinned, status FROM gallery WHERE short_id = ?",
+        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, preview_path, pinned, status FROM gallery WHERE short_id = ?",
     )
     .bind(&short_id)
     .fetch_one(&state.db.pool)
@@ -1042,7 +1104,7 @@ async fn generate_signed_url(
 }
 
 
-// GET /gallery/p/{short_id} - Serve preview image (on-the-fly, medium size)
+// GET /gallery/p/{short_id} - Serve preview image (pre-generated, medium size)
 async fn serve_preview_image(
     State(state): State<Arc<AppState>>,
     Path(short_id): Path<String>,
@@ -1051,7 +1113,7 @@ async fn serve_preview_image(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let item: Result<GalleryItem, _> = sqlx::query_as(
-        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, pinned, status FROM gallery WHERE short_id = ?",
+        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, preview_path, pinned, status FROM gallery WHERE short_id = ?",
     )
     .bind(&short_id)
     .fetch_one(&state.db.pool)
@@ -1098,49 +1160,36 @@ async fn serve_preview_image(
                 }
             }
 
-            // Read original file
-            match read_file(&state.config.storage_dir, &item.stored_path).await {
-                Ok(original_data) => {
-                    // Generate preview (non-blocking, max width 1280px, quality 85)
-                    let preview_result = tokio::task::spawn_blocking(move || {
-                        generate_and_encode_preview(&original_data, 1280)
-                    })
-                    .await;
+            // Check if preview exists, otherwise fallback to original
+            let file_path = if let Some(preview_path) = &item.preview_path {
+                preview_path
+            } else {
+                &item.stored_path
+            };
 
-                    match preview_result {
-                        Ok(Ok(preview_bytes)) => {
-                            let body = Body::from(preview_bytes);
-                            Response::builder()
-                                .status(StatusCode::OK)
-                                .header(header::CONTENT_TYPE, "image/webp")
-                                .header(header::CONTENT_DISPOSITION, "inline")
-                                .header(header::CACHE_CONTROL, "public, max-age=3600") // Cache for 1 hour
-                                .body(body)
-                                .unwrap()
-                        }
-                        Ok(Err(e)) => {
-                            tracing::error!("Failed to generate preview for {}: {}", short_id, e);
-                            build_error_response(
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                "Failed to generate image preview",
-                                &headers,
-                                &state.config.frontend_url,
-                            )
-                        }
-                        Err(e) => {
-                            tracing::error!("Preview generation task panicked for {}: {}", short_id, e);
-                            build_error_response(
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                "Failed to generate image preview",
-                                &headers,
-                                &state.config.frontend_url,
-                            )
-                        }
-                    }
+            match read_file(&state.config.storage_dir, file_path).await {
+                Ok(data) => {
+                    let body = Body::from(data);
+                    let content_type = if item.preview_path.is_some() {
+                        "image/webp" // Pre-generated previews are WebP
+                    } else {
+                        &item.mime_type // Fallback to original mime type
+                    };
+                    
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, content_type)
+                        .header(
+                            header::CONTENT_DISPOSITION,
+                            format!("inline; filename=\"preview_{}\"", item.original_filename),
+                        )
+                        .header(header::CACHE_CONTROL, "public, max-age=3600") // Cache for 1 hour
+                        .body(body)
+                        .unwrap()
                 }
                 Err(_) => build_error_response(
                     StatusCode::NOT_FOUND,
-                    "File not found on disk",
+                    "Preview not found on disk",
                     &headers,
                     &state.config.frontend_url,
                 ),
@@ -1161,7 +1210,7 @@ async fn list_pinned_gallery(
     State(state): State<Arc<AppState>>,
 ) -> (StatusCode, Json<ApiResponse<Vec<GalleryItem>>>) {
     let items: Result<Vec<GalleryItem>, _> = sqlx::query_as(
-        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, pinned, status FROM gallery WHERE user_id = ? AND pinned = TRUE ORDER BY updated_at DESC",
+        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, preview_path, pinned, status FROM gallery WHERE user_id = ? AND pinned = TRUE ORDER BY updated_at DESC",
     )
     .bind(auth_user.id)
     .fetch_all(&state.db.pool)
@@ -1187,7 +1236,7 @@ async fn update_image_pinned(
     Json(payload): Json<UpdatePinnedRequest>,
 ) -> (StatusCode, Json<ApiResponse<GalleryItem>>) {
     let item: Result<GalleryItem, _> = sqlx::query_as(
-        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, pinned, status FROM gallery WHERE id = ?",
+        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, preview_path, pinned, status FROM gallery WHERE id = ?",
     )
     .bind(id)
     .fetch_one(&state.db.pool)
@@ -1239,7 +1288,7 @@ async fn reprocess_image(
     
     // Fetch the item by id
     let item: Result<GalleryItem, _> = sqlx::query_as(
-        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, pinned, status FROM gallery WHERE id = ?",
+        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, preview_path, pinned, status FROM gallery WHERE id = ?",
     )
     .bind(id)
     .fetch_one(&state.db.pool)
