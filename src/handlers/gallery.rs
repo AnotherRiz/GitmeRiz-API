@@ -18,8 +18,7 @@ use crate::error_page::build_error_response;
 use crate::media::{
     delete_file, generate_storage_path, read_file, save_file, validate_extension, validate_size,
     get_extension, generate_short_id, generate_thumbnail_path, generate_preview_path,
-    generate_and_encode_thumbnail, generate_thumbnail_and_preview,
-    MediaType,
+    generate_thumbnail_and_preview, MediaType,
 };
 use crate::models::{ApiResponse, AuthUser};
 use crate::AppState;
@@ -1360,9 +1359,9 @@ async fn reprocess_image(
     let filename = item.original_filename.clone();
     let stored_path = item.stored_path.clone();
     
-    tracing::info!(%image_id, %filename, "Starting thumbnail reprocessing");
+    tracing::info!(%image_id, %filename, "Starting thumbnail and preview reprocessing");
 
-    // Acquire semaphore permit and generate thumbnail
+    // Acquire semaphore permit and generate thumbnail + preview
     let semaphore = state.image_semaphore.clone();
     let _permit = match semaphore.acquire_owned().await {
         Ok(permit) => permit,
@@ -1378,67 +1377,88 @@ async fn reprocess_image(
         }
     };
 
-    // Generate thumbnail (CPU-bound, use blocking pool)
-    let thumb_result = tokio::task::spawn_blocking(move || {
-        generate_and_encode_thumbnail(&file_data, 500)
+    // Generate thumbnail and preview (CPU-bound, use blocking pool)
+    // Uses optimized single decode + cascading resize
+    let process_result = tokio::task::spawn_blocking(move || {
+        generate_thumbnail_and_preview(&file_data)
     })
     .await;
 
-    match thumb_result {
-        Ok(Ok(thumbnail_data)) => {
-            // Save thumbnail to disk
+    match process_result {
+        Ok(Ok((thumbnail_data, preview_data))) => {
+            // Save both thumbnail and preview to disk in parallel
             let thumbnail_path = generate_thumbnail_path(&stored_path);
+            let preview_path = generate_preview_path(&stored_path);
             let thumbnail_full_path = std::path::PathBuf::from(&state.config.storage_dir).join(&thumbnail_path);
+            let preview_full_path = std::path::PathBuf::from(&state.config.storage_dir).join(&preview_path);
             
-            match save_file(&thumbnail_full_path, &thumbnail_data).await {
-                Ok(_) => {
-                    // Update status to active and set thumbnail_path
-                    let result = sqlx::query(
-                        "UPDATE gallery SET status = 'active', thumbnail_path = ? WHERE id = ?"
-                    )
-                    .bind(&thumbnail_path)
+            let thumb_save = save_file(&thumbnail_full_path, &thumbnail_data);
+            let preview_save = save_file(&preview_full_path, &preview_data);
+            
+            let (thumb_result, preview_result) = tokio::join!(thumb_save, preview_save);
+            
+            let mut save_errors = Vec::new();
+            let mut final_thumb_path = None;
+            let mut final_preview_path = None;
+            
+            match thumb_result {
+                Ok(_) => final_thumb_path = Some(thumbnail_path),
+                Err(e) => save_errors.push(format!("thumbnail: {}", e)),
+            }
+            
+            match preview_result {
+                Ok(_) => final_preview_path = Some(preview_path),
+                Err(e) => save_errors.push(format!("preview: {}", e)),
+            }
+            
+            if !save_errors.is_empty() {
+                tracing::error!(%image_id, "Failed to save files: {}", save_errors.join(", "));
+                let _ = sqlx::query("UPDATE gallery SET status = 'failed_processing' WHERE id = ?")
                     .bind(id)
                     .execute(&state.db.pool)
                     .await;
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ApiResponse::error(&format!("Failed to save files: {}", save_errors.join(", ")))),
+                );
+            }
 
-                    match result {
-                        Ok(_) => {
-                            item.status = "active".to_string();
-                            item.thumbnail_path = Some(thumbnail_path);
-                            tracing::info!(%image_id, "Thumbnail reprocessing successful");
-                            (StatusCode::OK, Json(ApiResponse::success(item)))
-                        }
-                        Err(e) => {
-                            tracing::error!("Failed to update database after reprocessing: {}", e);
-                            (
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                Json(ApiResponse::error("Failed to update database")),
-                            )
-                        }
-                    }
+            // Update status to active and set thumbnail_path + preview_path
+            let result = sqlx::query(
+                "UPDATE gallery SET status = 'active', thumbnail_path = ?, preview_path = ? WHERE id = ?"
+            )
+            .bind(&final_thumb_path)
+            .bind(&final_preview_path)
+            .bind(id)
+            .execute(&state.db.pool)
+            .await;
+
+            match result {
+                Ok(_) => {
+                    item.status = "active".to_string();
+                    item.thumbnail_path = final_thumb_path;
+                    item.preview_path = final_preview_path;
+                    tracing::info!(%image_id, "Thumbnail and preview reprocessing successful");
+                    (StatusCode::OK, Json(ApiResponse::success(item)))
                 }
                 Err(e) => {
-                    tracing::error!(%image_id, "Failed to save thumbnail: {}", e);
-                    let _ = sqlx::query("UPDATE gallery SET status = 'failed_processing' WHERE id = ?")
-                        .bind(id)
-                        .execute(&state.db.pool)
-                        .await;
+                    tracing::error!("Failed to update database after reprocessing: {}", e);
                     (
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(ApiResponse::error("Failed to save thumbnail to disk")),
+                        Json(ApiResponse::error("Failed to update database")),
                     )
                 }
             }
         }
         Ok(Err(e)) => {
-            tracing::error!(%image_id, "Thumbnail generation failed: {}", e);
+            tracing::error!(%image_id, "Image processing failed: {}", e);
             let _ = sqlx::query("UPDATE gallery SET status = 'failed_processing' WHERE id = ?")
                 .bind(id)
                 .execute(&state.db.pool)
                 .await;
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiResponse::error(&format!("Failed to generate thumbnail: {}", e))),
+                Json(ApiResponse::error(&format!("Failed to generate thumbnail and preview: {}", e))),
             )
         }
         Err(e) => {
