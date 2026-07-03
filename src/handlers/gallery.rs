@@ -948,8 +948,8 @@ async fn generate_signed_url(
             // Generate signature
             let sig = generate_signature(&short_id, item.user_id, expires, &state.config.jwt_secret);
 
-            // Build signed URL for both raw and thumbnail
-            let base_url = format!("{}/api/gallery", state.config.server_host);
+            // Build signed URL (no /api prefix since routes are at root level)
+            let base_url = format!("http://{}:{}/gallery", state.config.server_host, state.config.server_port);
             let raw_url = format!("{}/r/{}?expires={}&sig={}", base_url, short_id, expires, sig);
 
             (
