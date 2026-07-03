@@ -10,6 +10,7 @@ mod error_page;
 use axum::{middleware as axum_middleware, routing::get, Router};
 use axum::http::{header, HeaderValue, Method};
 use std::sync::Arc;
+use tokio::sync::Semaphore;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use tower_cookies::CookieManagerLayer;
@@ -23,6 +24,7 @@ use crate::middleware::auth_middleware;
 pub struct AppState {
     pub db: Database,
     pub config: Config,
+    pub image_semaphore: Arc<Semaphore>,
 }
 
 #[tokio::main]
@@ -46,7 +48,18 @@ async fn main() {
     // Run migrations
     db.migrate().await.expect("Failed to run migrations");
 
-    let state = Arc::new(AppState { db, config: config.clone() });
+    // Initialize semaphore for parallel image processing (memory ceiling)
+    let cpu_count = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let permit_count = cpu_count.clamp(4, 8);
+    tracing::info!("Image processing semaphore initialized with {} permits", permit_count);
+
+    let state = Arc::new(AppState { 
+        db, 
+        config: config.clone(),
+        image_semaphore: Arc::new(Semaphore::new(permit_count)),
+    });
 
     // Protected routes - require authentication
     let protected_routes = Router::new()
