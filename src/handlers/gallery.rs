@@ -18,7 +18,7 @@ use crate::error_page::build_error_response;
 use crate::media::{
     delete_file, generate_storage_path, read_file, save_file, validate_extension, validate_size,
     get_extension, generate_short_id, generate_thumbnail_path, generate_preview_path,
-    generate_and_encode_thumbnail, generate_and_encode_preview, generate_thumbnail_and_preview,
+    generate_and_encode_thumbnail, generate_thumbnail_and_preview,
     MediaType,
 };
 use crate::models::{ApiResponse, AuthUser};
@@ -430,7 +430,70 @@ async fn upload_image(
     let fail_count = processing_results.len() - success_count;
     tracing::info!(%batch_id, succeeded = success_count, failed = fail_count, "Image processing completed");
 
-    // Phase 3: Save thumbnails and insert into database
+    // Phase 3: Save thumbnails and previews in parallel, then insert into database
+    
+    // Phase 3.1: Parallel Disk I/O - Save all thumbnail and preview files concurrently
+    tracing::info!(%batch_id, "Starting parallel disk I/O for thumbnails and previews");
+    
+    let mut save_tasks = Vec::new();
+    
+    for (idx, result) in processing_results.iter().enumerate() {
+        if let Ok(Ok((_, thumb_path, prev_path, thumb_bytes, preview_bytes))) = result {
+            let storage_dir = state.config.storage_dir.clone();
+            let thumb_path_clone = thumb_path.clone();
+            let prev_path_clone = prev_path.clone();
+            let thumb_bytes_clone = thumb_bytes.clone();
+            let preview_bytes_clone = preview_bytes.clone();
+            let orig_filename = file_data[idx].orig_filename.clone();
+            
+            // Spawn task to save both thumbnail and preview for this image
+            let save_task = tokio::spawn(async move {
+                let mut results = (None, None);
+                
+                // Save thumbnail
+                let thumbnail_full_path = std::path::PathBuf::from(&storage_dir).join(&thumb_path_clone);
+                match save_file(&thumbnail_full_path, &thumb_bytes_clone).await {
+                    Ok(_) => results.0 = Some(thumb_path_clone.clone()),
+                    Err(e) => {
+                        tracing::warn!("Failed to save thumbnail for {}: {}", orig_filename, e);
+                    }
+                }
+                
+                // Save preview
+                let preview_full_path = std::path::PathBuf::from(&storage_dir).join(&prev_path_clone);
+                match save_file(&preview_full_path, &preview_bytes_clone).await {
+                    Ok(_) => results.1 = Some(prev_path_clone.clone()),
+                    Err(e) => {
+                        tracing::warn!("Failed to save preview for {}: {}", orig_filename, e);
+                    }
+                }
+                
+                (idx, results)
+            });
+            
+            save_tasks.push(save_task);
+        }
+    }
+    
+    // Wait for all disk I/O operations to complete
+    let save_results = futures::future::join_all(save_tasks).await;
+    
+    // Build a map of index -> (thumbnail_path, preview_path)
+    let mut saved_paths: std::collections::HashMap<usize, (Option<String>, Option<String>)> = std::collections::HashMap::new();
+    for result in save_results {
+        match result {
+            Ok((idx, (thumb_path, prev_path))) => {
+                saved_paths.insert(idx, (thumb_path, prev_path));
+            }
+            Err(e) => {
+                tracing::warn!("Disk I/O task failed: {}", e);
+            }
+        }
+    }
+    
+    tracing::info!(%batch_id, saved_files = saved_paths.len() * 2, "Parallel disk I/O completed");
+    
+    // Phase 3.2: Insert into database
     let mut uploaded_items = Vec::new();
     let mut tx = match state.db.pool.begin().await {
         Ok(tx) => tx,
@@ -448,31 +511,11 @@ async fn upload_image(
     };
 
     for (idx, data) in file_data.into_iter().enumerate() {
-        // Handle thumbnail and preview results
+        // Get saved paths from the parallel I/O results
         let (thumbnail_path, preview_path) = match &processing_results[idx] {
-            Ok(Ok((_, thumb_path, prev_path, thumb_bytes, preview_bytes))) => {
-                let mut final_thumb_path = None;
-                let mut final_preview_path = None;
-
-                // Save thumbnail
-                let thumbnail_full_path = std::path::PathBuf::from(&state.config.storage_dir).join(thumb_path);
-                match save_file(&thumbnail_full_path, thumb_bytes).await {
-                    Ok(_) => final_thumb_path = Some(thumb_path.clone()),
-                    Err(e) => {
-                        tracing::warn!("Failed to save thumbnail for {}: {}", data.orig_filename, e);
-                    }
-                }
-
-                // Save preview
-                let preview_full_path = std::path::PathBuf::from(&state.config.storage_dir).join(prev_path);
-                match save_file(&preview_full_path, preview_bytes).await {
-                    Ok(_) => final_preview_path = Some(prev_path.clone()),
-                    Err(e) => {
-                        tracing::warn!("Failed to save preview for {}: {}", data.orig_filename, e);
-                    }
-                }
-
-                (final_thumb_path, final_preview_path)
+            Ok(Ok(_)) => {
+                // Check if files were saved successfully
+                saved_paths.get(&idx).cloned().unwrap_or((None, None))
             }
             Ok(Err(e)) => {
                 tracing::warn!("Processing failed for {}: {}", data.orig_filename, e);
