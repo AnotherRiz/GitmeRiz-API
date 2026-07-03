@@ -35,3 +35,4 @@ uuid = { version = "1", features = ["v4"] }
 rand = "0.8"
 # Image processing
 image = "0.25"
+webp = "0.3"

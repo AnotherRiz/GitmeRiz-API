@@ -214,11 +214,10 @@ pub fn generate_thumbnail_path(original_stored_path: &str) -> String {
 }
 
 /// Generate thumbnail from image bytes
-/// - Max width: 500-600px (proportional resize, aspect ratio maintained)
-/// - Format: WebP with 80% quality
+/// - Max width: 500px (proportional resize, aspect ratio maintained)
+/// - Format: WebP lossy with quality 80
 /// - Returns: WebP bytes
 pub fn generate_and_encode_thumbnail(image_data: &[u8], max_width: u32) -> Result<Vec<u8>, String> {
-    use image::codecs::webp::WebPEncoder;
     use image::{GenericImageView, ImageReader};
     use std::io::Cursor;
     
@@ -244,13 +243,54 @@ pub fn generate_and_encode_thumbnail(image_data: &[u8], max_width: u32) -> Resul
     // Resize image
     let resized = img.resize(new_width, new_height, image::imageops::FilterType::Lanczos3);
     
+    // Convert to RGBA8 for webp crate
+    let rgba = resized.to_rgba8();
+    let (width, height) = (rgba.width(), rgba.height());
+    
     // Encode to WebP lossy with quality 80
-    let mut buffer = Vec::new();
-    let encoder = WebPEncoder::new_lossless(&mut buffer);
+    let encoder = webp::Encoder::from_rgba(&rgba, width, height);
+    let encoded = encoder.encode(80.0);
     
-    resized
-        .write_with_encoder(encoder)
-        .map_err(|e| format!("Failed to encode WebP: {}", e))?;
+    Ok(encoded.to_vec())
+}
+
+/// Generate preview image from bytes (on-the-fly, medium size)
+/// - Max width: 1280px (proportional resize, aspect ratio maintained)
+/// - Format: WebP lossy with quality 85
+/// - Returns: WebP bytes
+pub fn generate_and_encode_preview(image_data: &[u8], max_width: u32) -> Result<Vec<u8>, String> {
+    use image::{GenericImageView, ImageReader};
+    use std::io::Cursor;
     
-    Ok(buffer)
+    // Load image from bytes
+    let img = ImageReader::new(Cursor::new(image_data))
+        .with_guessed_format()
+        .map_err(|e| format!("Failed to detect image format: {}", e))?
+        .decode()
+        .map_err(|e| format!("Failed to decode image: {}", e))?;
+    
+    let (orig_width, orig_height) = img.dimensions();
+    
+    // Calculate new dimensions (aspect ratio preserved)
+    let (new_width, new_height) = if orig_width > max_width {
+        let ratio = max_width as f32 / orig_width as f32;
+        let new_height = (orig_height as f32 * ratio) as u32;
+        (max_width, new_height)
+    } else {
+        // Image already smaller than max_width, keep original size
+        (orig_width, orig_height)
+    };
+    
+    // Resize image
+    let resized = img.resize(new_width, new_height, image::imageops::FilterType::Lanczos3);
+    
+    // Convert to RGBA8 for webp crate
+    let rgba = resized.to_rgba8();
+    let (width, height) = (rgba.width(), rgba.height());
+    
+    // Encode to WebP lossy with quality 85 (higher quality for preview)
+    let encoder = webp::Encoder::from_rgba(&rgba, width, height);
+    let encoded = encoder.encode(85.0);
+    
+    Ok(encoded.to_vec())
 }
