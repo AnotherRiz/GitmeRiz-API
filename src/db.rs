@@ -152,6 +152,24 @@ impl Database {
             tracing::info!("Gallery thumbnail_path column added successfully");
         }
 
+        // Check if gallery table is missing 'pinned' column
+        let has_pinned = match sqlx::query("SHOW COLUMNS FROM gallery LIKE 'pinned'")
+            .fetch_optional(&self.pool)
+            .await
+        {
+            Ok(Some(_)) => true,
+            _ => false,
+        };
+
+        if !has_pinned {
+            tracing::info!("Adding pinned column to gallery table");
+            sqlx::query("ALTER TABLE gallery ADD COLUMN pinned BOOLEAN NOT NULL DEFAULT FALSE")
+                .execute(&self.pool)
+                .await?;
+            
+            tracing::info!("Gallery pinned column added successfully");
+        }
+
         // Create videos table with file storage columns
         sqlx::query(
             r#"

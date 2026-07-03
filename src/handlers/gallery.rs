@@ -16,7 +16,8 @@ use crate::auth::validate_token;
 use crate::error_page::build_error_response;
 use crate::media::{
     delete_file, generate_storage_path, read_file, save_file, validate_extension, validate_size,
-    get_extension, generate_short_id, generate_thumbnail_path, generate_and_encode_thumbnail, MediaType,
+    get_extension, generate_short_id, generate_thumbnail_path, generate_and_encode_thumbnail, 
+    generate_and_encode_preview, MediaType,
 };
 use crate::models::{ApiResponse, AuthUser};
 use crate::AppState;
@@ -34,6 +35,7 @@ pub struct GalleryItem {
     pub short_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thumbnail_path: Option<String>,
+    pub pinned: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -48,6 +50,10 @@ struct UpdateTitleRequest {
     title: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct UpdatePinnedRequest {
+    pinned: bool,
+}
 #[derive(Debug, Deserialize)]
 struct UpdateVisibilityRequest {
     visibility: String,
@@ -116,15 +122,18 @@ pub fn public_routes() -> Router<Arc<AppState>> {
         .route("/gallery/d/{id}", get(download_image))
         .route("/gallery/r/{short_id}", get(serve_raw_image))
         .route("/gallery/t/{short_id}", get(serve_thumbnail_image))
+        .route("/gallery/p/{short_id}", get(serve_preview_image))
 }
 
 pub fn protected_routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/gallery", post(upload_image))
         .route("/gallery/me", get(list_my_gallery))
+        .route("/gallery/me/pinned", get(list_pinned_gallery))
         .route("/gallery/{id}", delete(delete_image))
         .route("/gallery/{id}/title", patch(update_image_title))
         .route("/gallery/{id}/visibility", patch(update_image_visibility))
+        .route("/gallery/{id}/pinned", patch(update_image_pinned))
         .route("/gallery/{short_id}/sign", post(generate_signed_url))
 }
 
@@ -176,7 +185,7 @@ async fn list_gallery(
     State(state): State<Arc<AppState>>,
 ) -> (StatusCode, Json<ApiResponse<Vec<GalleryItem>>>) {
     let items: Result<Vec<GalleryItem>, _> = sqlx::query_as(
-        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path FROM gallery WHERE visibility = 'public' ORDER BY id DESC",
+        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, pinned FROM gallery WHERE visibility = 'public' ORDER BY id DESC",
     )
     .fetch_all(&state.db.pool)
     .await;
@@ -199,7 +208,7 @@ async fn list_my_gallery(
     State(state): State<Arc<AppState>>,
 ) -> (StatusCode, Json<ApiResponse<Vec<GalleryItem>>>) {
     let items: Result<Vec<GalleryItem>, _> = sqlx::query_as(
-        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path FROM gallery WHERE user_id = ? ORDER BY id DESC",
+        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, pinned FROM gallery WHERE user_id = ? ORDER BY id DESC",
     )
     .bind(auth_user.id)
     .fetch_all(&state.db.pool)
@@ -329,19 +338,29 @@ async fn upload_image(
         // Track saved path for cleanup
         saved_paths.push(stored_path.clone());
 
-        // Generate and save thumbnail (max width 500px, WebP 80% quality)
+        // Generate and save thumbnail (non-blocking, max width 500px, WebP lossy quality 80)
+        let file_bytes_for_thumb = file_bytes.clone();
+        let thumb_result = tokio::task::spawn_blocking(move || {
+            generate_and_encode_thumbnail(&file_bytes_for_thumb, 500)
+        })
+        .await;
+
         let thumbnail_path = generate_thumbnail_path(&stored_path);
         let thumbnail_full_path = std::path::PathBuf::from(&state.config.storage_dir).join(&thumbnail_path);
         
-        match generate_and_encode_thumbnail(&file_bytes, 500) {
-            Ok(thumbnail_data) => {
+        match thumb_result {
+            Ok(Ok(thumbnail_data)) => {
                 if let Err(e) = save_file(&thumbnail_full_path, &thumbnail_data).await {
                     tracing::warn!("Failed to save thumbnail for {}: {}", orig_filename, e);
                     // Continue without thumbnail - not critical
                 }
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 tracing::warn!("Failed to generate thumbnail for {}: {}", orig_filename, e);
+                // Continue without thumbnail - not critical
+            }
+            Err(e) => {
+                tracing::warn!("Thumbnail generation task panicked for {}: {}", orig_filename, e);
                 // Continue without thumbnail - not critical
             }
         }
@@ -415,6 +434,7 @@ async fn upload_image(
                     visibility: visibility.clone(),
                     short_id,
                     thumbnail_path: Some(thumbnail_path),
+                    pinned: false,
                 });
             }
             Err(e) => {
@@ -458,7 +478,7 @@ async fn get_image(
     Path(id): Path<i32>,
 ) -> (StatusCode, Json<ApiResponse<GalleryItem>>) {
     let item: Result<GalleryItem, _> = sqlx::query_as(
-        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path FROM gallery WHERE id = ?",
+        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, pinned FROM gallery WHERE id = ?",
     )
     .bind(id)
     .fetch_one(&state.db.pool)
@@ -479,7 +499,7 @@ async fn download_image(
     Path(id): Path<i32>,
 ) -> impl IntoResponse {
     let item: Result<GalleryItem, _> = sqlx::query_as(
-        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path FROM gallery WHERE id = ?",
+        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, pinned FROM gallery WHERE id = ?",
     )
     .bind(id)
     .fetch_one(&state.db.pool)
@@ -530,7 +550,7 @@ async fn update_image_title(
     }
 
     let item: Result<GalleryItem, _> = sqlx::query_as(
-        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path FROM gallery WHERE id = ?",
+        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, pinned FROM gallery WHERE id = ?",
     )
     .bind(id)
     .fetch_one(&state.db.pool)
@@ -588,7 +608,7 @@ async fn update_image_visibility(
     }
 
     let item: Result<GalleryItem, _> = sqlx::query_as(
-        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path FROM gallery WHERE id = ?",
+        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, pinned FROM gallery WHERE id = ?",
     )
     .bind(id)
     .fetch_one(&state.db.pool)
@@ -637,7 +657,7 @@ async fn delete_image(
     Path(id): Path<i32>,
 ) -> (StatusCode, Json<ApiResponse<String>>) {
     let item: Result<GalleryItem, _> = sqlx::query_as(
-        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path FROM gallery WHERE id = ?",
+        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, pinned FROM gallery WHERE id = ?",
     )
     .bind(id)
     .fetch_one(&state.db.pool)
@@ -699,7 +719,7 @@ async fn serve_raw_image(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let item: Result<GalleryItem, _> = sqlx::query_as(
-        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path FROM gallery WHERE short_id = ?",
+        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, pinned FROM gallery WHERE short_id = ?",
     )
     .bind(&short_id)
     .fetch_one(&state.db.pool)
@@ -796,7 +816,7 @@ async fn serve_thumbnail_image(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let item: Result<GalleryItem, _> = sqlx::query_as(
-        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path FROM gallery WHERE short_id = ?",
+        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, pinned FROM gallery WHERE short_id = ?",
     )
     .bind(&short_id)
     .fetch_one(&state.db.pool)
@@ -906,7 +926,7 @@ async fn generate_signed_url(
 ) -> (StatusCode, Json<ApiResponse<SignedUrlResponse>>) {
     // Fetch the image
     let item: Result<GalleryItem, _> = sqlx::query_as(
-        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path FROM gallery WHERE short_id = ?",
+        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, pinned FROM gallery WHERE short_id = ?",
     )
     .bind(&short_id)
     .fetch_one(&state.db.pool)
@@ -928,8 +948,8 @@ async fn generate_signed_url(
             // Generate signature
             let sig = generate_signature(&short_id, item.user_id, expires, &state.config.jwt_secret);
 
-            // Build signed URL for both raw and thumbnail
-            let base_url = format!("{}/api/gallery", state.config.server_host);
+            // Build signed URL (no /api prefix since routes are at root level)
+            let base_url = format!("http://{}:{}/gallery", state.config.server_host, state.config.server_port);
             let raw_url = format!("{}/r/{}?expires={}&sig={}", base_url, short_id, expires, sig);
 
             (
@@ -939,6 +959,194 @@ async fn generate_signed_url(
                     expires_at: expires,
                 })),
             )
+        }
+        Err(_) => (
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::error("Image not found")),
+        ),
+    }
+}
+
+
+// GET /gallery/p/{short_id} - Serve preview image (on-the-fly, medium size)
+async fn serve_preview_image(
+    State(state): State<Arc<AppState>>,
+    Path(short_id): Path<String>,
+    Query(query): Query<ImageQuery>,
+    cookies: Cookies,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let item: Result<GalleryItem, _> = sqlx::query_as(
+        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, pinned FROM gallery WHERE short_id = ?",
+    )
+    .bind(&short_id)
+    .fetch_one(&state.db.pool)
+    .await;
+
+    match item {
+        Ok(item) => {
+            // Access control (same as raw and thumbnail)
+            if item.visibility == "private" {
+                if query.expires.is_some() && query.sig.is_some() {
+                    match validate_signed_url(&query, &short_id, item.user_id, &state.config.jwt_secret) {
+                        Ok(()) => {},
+                        Err(e) => {
+                            return build_error_response(
+                                StatusCode::UNAUTHORIZED,
+                                e,
+                                &headers,
+                                &state.config.frontend_url,
+                            );
+                        }
+                    }
+                } else {
+                    let auth_user = extract_optional_auth(&cookies, &headers, &state.config.jwt_secret);
+                    match auth_user {
+                        Some(user) => {
+                            if item.user_id != user.id && !user.is_superuser() {
+                                return build_error_response(
+                                    StatusCode::FORBIDDEN,
+                                    "You can only access your own private images",
+                                    &headers,
+                                    &state.config.frontend_url,
+                                );
+                            }
+                        }
+                        None => {
+                            return build_error_response(
+                                StatusCode::UNAUTHORIZED,
+                                "This image is private. Authentication required.",
+                                &headers,
+                                &state.config.frontend_url,
+                            );
+                        }
+                    }
+                }
+            }
+
+            // Read original file
+            match read_file(&state.config.storage_dir, &item.stored_path).await {
+                Ok(original_data) => {
+                    // Generate preview (non-blocking, max width 1280px, quality 85)
+                    let preview_result = tokio::task::spawn_blocking(move || {
+                        generate_and_encode_preview(&original_data, 1280)
+                    })
+                    .await;
+
+                    match preview_result {
+                        Ok(Ok(preview_bytes)) => {
+                            let body = Body::from(preview_bytes);
+                            Response::builder()
+                                .status(StatusCode::OK)
+                                .header(header::CONTENT_TYPE, "image/webp")
+                                .header(header::CONTENT_DISPOSITION, "inline")
+                                .header(header::CACHE_CONTROL, "public, max-age=3600") // Cache for 1 hour
+                                .body(body)
+                                .unwrap()
+                        }
+                        Ok(Err(e)) => {
+                            tracing::error!("Failed to generate preview for {}: {}", short_id, e);
+                            build_error_response(
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                "Failed to generate image preview",
+                                &headers,
+                                &state.config.frontend_url,
+                            )
+                        }
+                        Err(e) => {
+                            tracing::error!("Preview generation task panicked for {}: {}", short_id, e);
+                            build_error_response(
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                "Failed to generate image preview",
+                                &headers,
+                                &state.config.frontend_url,
+                            )
+                        }
+                    }
+                }
+                Err(_) => build_error_response(
+                    StatusCode::NOT_FOUND,
+                    "File not found on disk",
+                    &headers,
+                    &state.config.frontend_url,
+                ),
+            }
+        }
+        Err(_) => build_error_response(
+            StatusCode::NOT_FOUND,
+            "Image not found",
+            &headers,
+            &state.config.frontend_url,
+        ),
+    }
+}
+
+// GET /gallery/me/pinned - List pinned images for authenticated user
+async fn list_pinned_gallery(
+    Extension(auth_user): Extension<AuthUser>,
+    State(state): State<Arc<AppState>>,
+) -> (StatusCode, Json<ApiResponse<Vec<GalleryItem>>>) {
+    let items: Result<Vec<GalleryItem>, _> = sqlx::query_as(
+        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, pinned FROM gallery WHERE user_id = ? AND pinned = TRUE ORDER BY updated_at DESC",
+    )
+    .bind(auth_user.id)
+    .fetch_all(&state.db.pool)
+    .await;
+
+    match items {
+        Ok(items) => (StatusCode::OK, Json(ApiResponse::success(items))),
+        Err(e) => {
+            tracing::error!("Failed to fetch pinned gallery items: {:?}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::error("Failed to fetch pinned gallery items")),
+            )
+        }
+    }
+}
+
+// PATCH /gallery/{id}/pinned - Update pinned status (owner or superuser)
+async fn update_image_pinned(
+    Extension(auth_user): Extension<AuthUser>,
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i32>,
+    Json(payload): Json<UpdatePinnedRequest>,
+) -> (StatusCode, Json<ApiResponse<GalleryItem>>) {
+    let item: Result<GalleryItem, _> = sqlx::query_as(
+        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, pinned FROM gallery WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_one(&state.db.pool)
+    .await;
+
+    match item {
+        Ok(mut item) => {
+            if item.user_id != auth_user.id && !auth_user.is_superuser() {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(ApiResponse::error("You can only edit your own images")),
+                );
+            }
+
+            let result = sqlx::query("UPDATE gallery SET pinned = ? WHERE id = ?")
+                .bind(payload.pinned)
+                .bind(id)
+                .execute(&state.db.pool)
+                .await;
+
+            match result {
+                Ok(_) => {
+                    item.pinned = payload.pinned;
+                    (StatusCode::OK, Json(ApiResponse::success(item)))
+                }
+                Err(e) => {
+                    tracing::error!("Failed to update image pinned status: {:?}", e);
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ApiResponse::error("Failed to update pinned status")),
+                    )
+                }
+            }
         }
         Err(_) => (
             StatusCode::NOT_FOUND,
