@@ -83,7 +83,6 @@ struct FileProcessData {
     orig_filename: String,
     item_title: String,
     file_bytes: Vec<u8>,
-    extension: String,
     mime_type: String,
     size_bytes: i64,
 }
@@ -357,7 +356,6 @@ async fn upload_image(
             orig_filename,
             item_title,
             file_bytes,
-            extension,
             mime_type: mime_type.to_string(),
             size_bytes,
         });
