@@ -40,6 +40,7 @@ pub struct GalleryItem {
     pub preview_path: Option<String>,
     pub pinned: bool,
     pub status: String,
+    pub pin_order: i32,
 }
 
 #[derive(Debug, Serialize)]
@@ -67,6 +68,11 @@ struct UpdateVisibilityRequest {
 #[derive(Debug, Deserialize)]
 struct StatusCheckRequest {
     ids: Vec<i32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReorderPinsRequest {
+    ordered_ids: Vec<i32>,
 }
 
 // Query parameters for image access with signed URL
@@ -141,6 +147,7 @@ pub fn protected_routes() -> Router<Arc<AppState>> {
         .route("/gallery/me", get(list_my_gallery))
         .route("/gallery/me/pinned", get(list_pinned_gallery))
         .route("/gallery/status", post(check_status))
+        .route("/gallery/reorder-pins", patch(reorder_pins))
         .route("/gallery/{id}", delete(delete_image))
         .route("/gallery/{id}/title", patch(update_image_title))
         .route("/gallery/{id}/visibility", patch(update_image_visibility))
@@ -197,7 +204,7 @@ async fn list_gallery(
     State(state): State<Arc<AppState>>,
 ) -> (StatusCode, Json<ApiResponse<Vec<GalleryItem>>>) {
     let items: Result<Vec<GalleryItem>, _> = sqlx::query_as(
-        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, preview_path, pinned, status FROM gallery WHERE visibility = 'public' ORDER BY id DESC",
+        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, preview_path, pinned, status, pin_order FROM gallery WHERE visibility = 'public' ORDER BY id DESC",
     )
     .fetch_all(&state.db.pool)
     .await;
@@ -220,7 +227,7 @@ async fn list_my_gallery(
     State(state): State<Arc<AppState>>,
 ) -> (StatusCode, Json<ApiResponse<Vec<GalleryItem>>>) {
     let items: Result<Vec<GalleryItem>, _> = sqlx::query_as(
-        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, preview_path, pinned, status FROM gallery WHERE user_id = ? ORDER BY id DESC",
+        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, preview_path, pinned, status, pin_order FROM gallery WHERE user_id = ? ORDER BY id DESC",
     )
     .bind(auth_user.id)
     .fetch_all(&state.db.pool)
@@ -415,6 +422,7 @@ async fn upload_image(
                     preview_path: None,    // Generated in background
                     pinned: false,
                     status: "processing".to_string(),
+                    pin_order: 0,
                 });
             }
             Err(e) => {
@@ -597,7 +605,7 @@ async fn get_image(
     Path(id): Path<i32>,
 ) -> (StatusCode, Json<ApiResponse<GalleryItem>>) {
     let item: Result<GalleryItem, _> = sqlx::query_as(
-        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, preview_path, pinned, status FROM gallery WHERE id = ?",
+        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, preview_path, pinned, status, pin_order FROM gallery WHERE id = ?",
     )
     .bind(id)
     .fetch_one(&state.db.pool)
@@ -618,7 +626,7 @@ async fn download_image(
     Path(id): Path<i32>,
 ) -> impl IntoResponse {
     let item: Result<GalleryItem, _> = sqlx::query_as(
-        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, preview_path, pinned, status FROM gallery WHERE id = ?",
+        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, preview_path, pinned, status, pin_order FROM gallery WHERE id = ?",
     )
     .bind(id)
     .fetch_one(&state.db.pool)
@@ -669,7 +677,7 @@ async fn update_image_title(
     }
 
     let item: Result<GalleryItem, _> = sqlx::query_as(
-        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, preview_path, pinned, status FROM gallery WHERE id = ?",
+        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, preview_path, pinned, status, pin_order FROM gallery WHERE id = ?",
     )
     .bind(id)
     .fetch_one(&state.db.pool)
@@ -727,7 +735,7 @@ async fn update_image_visibility(
     }
 
     let item: Result<GalleryItem, _> = sqlx::query_as(
-        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, preview_path, pinned, status FROM gallery WHERE id = ?",
+        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, preview_path, pinned, status, pin_order FROM gallery WHERE id = ?",
     )
     .bind(id)
     .fetch_one(&state.db.pool)
@@ -776,7 +784,7 @@ async fn delete_image(
     Path(id): Path<i32>,
 ) -> (StatusCode, Json<ApiResponse<String>>) {
     let item: Result<GalleryItem, _> = sqlx::query_as(
-        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, preview_path, pinned, status FROM gallery WHERE id = ?",
+        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, preview_path, pinned, status, pin_order FROM gallery WHERE id = ?",
     )
     .bind(id)
     .fetch_one(&state.db.pool)
@@ -845,7 +853,7 @@ async fn serve_raw_image(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let item: Result<GalleryItem, _> = sqlx::query_as(
-        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, preview_path, pinned, status FROM gallery WHERE short_id = ?",
+        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, preview_path, pinned, status, pin_order FROM gallery WHERE short_id = ?",
     )
     .bind(&short_id)
     .fetch_one(&state.db.pool)
@@ -942,7 +950,7 @@ async fn serve_thumbnail_image(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let item: Result<GalleryItem, _> = sqlx::query_as(
-        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, preview_path, pinned, status FROM gallery WHERE short_id = ?",
+        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, preview_path, pinned, status, pin_order FROM gallery WHERE short_id = ?",
     )
     .bind(&short_id)
     .fetch_one(&state.db.pool)
@@ -1052,7 +1060,7 @@ async fn generate_signed_url(
 ) -> (StatusCode, Json<ApiResponse<SignedUrlResponse>>) {
     // Fetch the image
     let item: Result<GalleryItem, _> = sqlx::query_as(
-        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, preview_path, pinned, status FROM gallery WHERE short_id = ?",
+        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, preview_path, pinned, status, pin_order FROM gallery WHERE short_id = ?",
     )
     .bind(&short_id)
     .fetch_one(&state.db.pool)
@@ -1103,7 +1111,7 @@ async fn serve_preview_image(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let item: Result<GalleryItem, _> = sqlx::query_as(
-        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, preview_path, pinned, status FROM gallery WHERE short_id = ?",
+        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, preview_path, pinned, status, pin_order FROM gallery WHERE short_id = ?",
     )
     .bind(&short_id)
     .fetch_one(&state.db.pool)
@@ -1200,7 +1208,7 @@ async fn list_pinned_gallery(
     State(state): State<Arc<AppState>>,
 ) -> (StatusCode, Json<ApiResponse<Vec<GalleryItem>>>) {
     let items: Result<Vec<GalleryItem>, _> = sqlx::query_as(
-        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, preview_path, pinned, status FROM gallery WHERE user_id = ? AND pinned = TRUE ORDER BY updated_at DESC",
+        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, preview_path, pinned, status, pin_order FROM gallery WHERE user_id = ? AND pinned = TRUE ORDER BY pin_order ASC, updated_at DESC",
     )
     .bind(auth_user.id)
     .fetch_all(&state.db.pool)
@@ -1284,8 +1292,10 @@ async fn update_image_pinned(
     Path(id): Path<i32>,
     Json(payload): Json<UpdatePinnedRequest>,
 ) -> (StatusCode, Json<ApiResponse<GalleryItem>>) {
+    const MAX_PINNED_IMAGES: i64 = 8;
+    
     let item: Result<GalleryItem, _> = sqlx::query_as(
-        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, preview_path, pinned, status FROM gallery WHERE id = ?",
+        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, preview_path, pinned, status, pin_order FROM gallery WHERE id = ?",
     )
     .bind(id)
     .fetch_one(&state.db.pool)
@@ -1300,24 +1310,98 @@ async fn update_image_pinned(
                 );
             }
 
-            let result = sqlx::query("UPDATE gallery SET pinned = ? WHERE id = ?")
-                .bind(payload.pinned)
-                .bind(id)
-                .execute(&state.db.pool)
+            // If pinning, check the limit and assign pin_order
+            if payload.pinned && !item.pinned {
+                // Count existing pinned images
+                let count_result: Result<(i64,), _> = sqlx::query_as(
+                    "SELECT COUNT(*) FROM gallery WHERE user_id = ? AND pinned = TRUE"
+                )
+                .bind(auth_user.id)
+                .fetch_one(&state.db.pool)
                 .await;
 
-            match result {
-                Ok(_) => {
-                    item.pinned = payload.pinned;
-                    (StatusCode::OK, Json(ApiResponse::success(item)))
+                match count_result {
+                    Ok((count,)) => {
+                        if count >= MAX_PINNED_IMAGES {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                Json(ApiResponse::error(&format!("You can only pin up to {} images. Please unpin another image first.", MAX_PINNED_IMAGES))),
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to count pinned images: {:?}", e);
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(ApiResponse::error("Failed to check pinned count")),
+                        );
+                    }
                 }
-                Err(e) => {
-                    tracing::error!("Failed to update image pinned status: {:?}", e);
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(ApiResponse::error("Failed to update pinned status")),
-                    )
+
+                // Get max pin_order and assign next value
+                let max_order_result: Result<Option<(i32,)>, _> = sqlx::query_as(
+                    "SELECT MAX(pin_order) FROM gallery WHERE user_id = ? AND pinned = TRUE"
+                )
+                .bind(auth_user.id)
+                .fetch_optional(&state.db.pool)
+                .await;
+
+                let new_pin_order = match max_order_result {
+                    Ok(Some((max_order,))) => max_order + 1,
+                    Ok(None) => 1,
+                    Err(e) => {
+                        tracing::error!("Failed to get max pin_order: {:?}", e);
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(ApiResponse::error("Failed to assign pin order")),
+                        );
+                    }
+                };
+
+                let result = sqlx::query("UPDATE gallery SET pinned = TRUE, pin_order = ? WHERE id = ?")
+                    .bind(new_pin_order)
+                    .bind(id)
+                    .execute(&state.db.pool)
+                    .await;
+
+                match result {
+                    Ok(_) => {
+                        item.pinned = true;
+                        item.pin_order = new_pin_order;
+                        (StatusCode::OK, Json(ApiResponse::success(item)))
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to update image pinned status: {:?}", e);
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(ApiResponse::error("Failed to update pinned status")),
+                        )
+                    }
                 }
+            } else if !payload.pinned && item.pinned {
+                // Unpinning: reset pin_order to 0
+                let result = sqlx::query("UPDATE gallery SET pinned = FALSE, pin_order = 0 WHERE id = ?")
+                    .bind(id)
+                    .execute(&state.db.pool)
+                    .await;
+
+                match result {
+                    Ok(_) => {
+                        item.pinned = false;
+                        item.pin_order = 0;
+                        (StatusCode::OK, Json(ApiResponse::success(item)))
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to update image pinned status: {:?}", e);
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(ApiResponse::error("Failed to update pinned status")),
+                        )
+                    }
+                }
+            } else {
+                // No change needed
+                (StatusCode::OK, Json(ApiResponse::success(item)))
             }
         }
         Err(_) => (
@@ -1337,7 +1421,7 @@ async fn reprocess_image(
     
     // Fetch the item by id
     let item: Result<GalleryItem, _> = sqlx::query_as(
-        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, preview_path, pinned, status FROM gallery WHERE id = ?",
+        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, preview_path, pinned, status, pin_order FROM gallery WHERE id = ?",
     )
     .bind(id)
     .fetch_one(&state.db.pool)
@@ -1499,3 +1583,109 @@ async fn reprocess_image(
     }
 }
 
+
+// PATCH /gallery/reorder-pins - Reorder pinned images (owner or superuser)
+async fn reorder_pins(
+    Extension(auth_user): Extension<AuthUser>,
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<ReorderPinsRequest>,
+) -> (StatusCode, Json<ApiResponse<String>>) {
+    if payload.ordered_ids.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::error("No image IDs provided")),
+        );
+    }
+
+    if payload.ordered_ids.len() > 8 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::error("Cannot reorder more than 8 pinned images")),
+        );
+    }
+
+    // Start transaction for atomic updates
+    let mut tx = match state.db.pool.begin().await {
+        Ok(tx) => tx,
+        Err(e) => {
+            tracing::error!("Failed to start transaction: {:?}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::error("Failed to start database transaction")),
+            );
+        }
+    };
+
+    // Verify all images exist and belong to user
+    for id in &payload.ordered_ids {
+        let check_result: Result<Option<(i32, bool)>, _> = sqlx::query_as(
+            "SELECT user_id, pinned FROM gallery WHERE id = ?"
+        )
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await;
+
+        match check_result {
+            Ok(Some((user_id, pinned))) => {
+                if user_id != auth_user.id && !auth_user.is_superuser() {
+                    return (
+                        StatusCode::FORBIDDEN,
+                        Json(ApiResponse::error("You can only reorder your own images")),
+                    );
+                }
+                if !pinned {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(ApiResponse::error(&format!("Image {} is not pinned", id))),
+                    );
+                }
+            }
+            Ok(None) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(ApiResponse::error(&format!("Image {} not found", id))),
+                );
+            }
+            Err(e) => {
+                tracing::error!("Failed to check image ownership: {:?}", e);
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ApiResponse::error("Failed to verify image ownership")),
+                );
+            }
+        }
+    }
+
+    // Update pin_order for each image based on array position
+    for (index, id) in payload.ordered_ids.iter().enumerate() {
+        let new_order = (index + 1) as i32; // Start from 1
+        let result = sqlx::query("UPDATE gallery SET pin_order = ? WHERE id = ?")
+            .bind(new_order)
+            .bind(id)
+            .execute(&mut *tx)
+            .await;
+
+        if let Err(e) = result {
+            tracing::error!("Failed to update pin_order for image {}: {:?}", id, e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::error(&format!("Failed to update pin order for image {}", id))),
+            );
+        }
+    }
+
+    // Commit transaction
+    if let Err(e) = tx.commit().await {
+        tracing::error!("Failed to commit transaction: {:?}", e);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse::error("Failed to commit pin order changes")),
+        );
+    }
+
+    tracing::info!(user_id = auth_user.id, count = payload.ordered_ids.len(), "Successfully reordered pinned images");
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success("Pin order updated successfully".to_string())),
+    )
+}
