@@ -58,9 +58,15 @@ struct UpdateTitleRequest {
 struct UpdatePinnedRequest {
     pinned: bool,
 }
+
 #[derive(Debug, Deserialize)]
 struct UpdateVisibilityRequest {
     visibility: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct StatusCheckRequest {
+    ids: Vec<i32>,
 }
 
 // Query parameters for image access with signed URL
@@ -144,6 +150,7 @@ pub fn protected_routes() -> Router<Arc<AppState>> {
         .route("/gallery", post(upload_image))
         .route("/gallery/me", get(list_my_gallery))
         .route("/gallery/me/pinned", get(list_pinned_gallery))
+        .route("/gallery/status", post(check_status))
         .route("/gallery/{id}", delete(delete_image))
         .route("/gallery/{id}/title", patch(update_image_title))
         .route("/gallery/{id}/visibility", patch(update_image_visibility))
@@ -1248,6 +1255,65 @@ async fn list_pinned_gallery(
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ApiResponse::error("Failed to fetch pinned gallery items")),
+            )
+        }
+    }
+}
+
+// POST /gallery/status - Check status of multiple images
+async fn check_status(
+    Extension(auth_user): Extension<AuthUser>,
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<StatusCheckRequest>,
+) -> impl IntoResponse {
+    use std::collections::HashMap;
+    
+    if payload.ids.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<HashMap<i32, String>>::error("No IDs provided")),
+        );
+    }
+    
+    if payload.ids.len() > 100 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<HashMap<i32, String>>::error("Too many IDs (max 100)")),
+        );
+    }
+    
+    // Build SQL query with IN clause
+    let placeholders = payload.ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let query = format!(
+        "SELECT id, status FROM gallery WHERE id IN ({}) AND user_id = ?",
+        placeholders
+    );
+    
+    let mut query_builder = sqlx::query_as::<_, (i32, String)>(&query);
+    for id in &payload.ids {
+        query_builder = query_builder.bind(id);
+    }
+    query_builder = query_builder.bind(auth_user.id);
+    
+    let results = query_builder.fetch_all(&state.db.pool).await;
+    
+    match results {
+        Ok(rows) => {
+            let mut status_map = HashMap::new();
+            for (id, status) in rows {
+                status_map.insert(id, status);
+            }
+            
+            // For IDs not found (either doesn't exist or not owned by user), return null/not found
+            // Client can detect missing IDs if needed
+            
+            (StatusCode::OK, Json(ApiResponse::success(status_map)))
+        }
+        Err(e) => {
+            tracing::error!("Failed to check status: {:?}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::<HashMap<i32, String>>::error("Failed to check status")),
             )
         }
     }
