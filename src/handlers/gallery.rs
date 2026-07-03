@@ -11,6 +11,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use tower_cookies::Cookies;
+use tracing::Instrument;
 
 use crate::auth::validate_token;
 use crate::error_page::build_error_response;
@@ -243,6 +244,10 @@ async fn upload_image(
     State(state): State<Arc<AppState>>,
     mut multipart: Multipart,
 ) -> (StatusCode, Json<ApiResponse<UploadResponse>>) {
+    use uuid::Uuid;
+    
+    let batch_id = Uuid::new_v4();
+    
     let mut title: Option<String> = None;
     let mut visibility = "private".to_string();
     let mut files = Vec::new();
@@ -291,6 +296,8 @@ async fn upload_image(
             Json(ApiResponse::error("No file provided")),
         );
     }
+
+    tracing::info!(%batch_id, file_count = files.len(), "Starting bulk upload");
 
     // First pass: Validation
     for (orig_filename, file_bytes) in &files {
@@ -361,30 +368,48 @@ async fn upload_image(
         let semaphore = state.image_semaphore.clone();
         let bytes = data.file_bytes.clone();
         let path = data.stored_path.clone();
+        let filename = data.orig_filename.clone();
+        let image_id = Uuid::new_v4();
 
-        let task = tokio::spawn(async move {
-            // Wait here if too many images are already decoding (memory ceiling)
-            let _permit = semaphore.acquire_owned().await
-                .map_err(|_| "semaphore closed".to_string())?;
+        let task = tokio::spawn(
+            async move {
+                tracing::info!("Starting thumbnail generation");
+                
+                // Wait here if too many images are already decoding (memory ceiling)
+                let _permit = semaphore.acquire_owned().await
+                    .map_err(|_| "semaphore closed".to_string())?;
 
-            // CPU-bound work goes on the blocking pool
-            let thumb = tokio::task::spawn_blocking(move || {
-                generate_and_encode_thumbnail(&bytes, 500)
-            })
-            .await
-            .map_err(|e| format!("thumbnail task panicked: {}", e))??;
+                tracing::debug!("Semaphore permit acquired, decoding image");
 
-            let thumbnail_path = generate_thumbnail_path(&path);
-            
-            Ok::<(usize, String, Vec<u8>), String>((index, thumbnail_path, thumb))
-            // _permit is dropped here, releasing the slot for the next image
-        });
+                // CPU-bound work goes on the blocking pool
+                let thumb = tokio::task::spawn_blocking(move || {
+                    generate_and_encode_thumbnail(&bytes, 500)
+                })
+                .await
+                .map_err(|e| {
+                    tracing::error!("Thumbnail task panicked: {}", e);
+                    format!("thumbnail task panicked: {}", e)
+                })??;
+
+                let thumbnail_path = generate_thumbnail_path(&path);
+                
+                tracing::info!("Thumbnail encoded successfully");
+                
+                Ok::<(usize, String, Vec<u8>), String>((index, thumbnail_path, thumb))
+                // _permit is dropped here, releasing the slot for the next image
+            }
+            .instrument(tracing::info_span!("process_image", %batch_id, %image_id, %filename))
+        );
 
         thumbnail_tasks.push(task);
     }
 
     // Collect all thumbnail results
     let thumbnail_results = futures::future::join_all(thumbnail_tasks).await;
+    
+    let success_count = thumbnail_results.iter().filter(|r| matches!(r, Ok(Ok(_)))).count();
+    let fail_count = thumbnail_results.len() - success_count;
+    tracing::info!(%batch_id, succeeded = success_count, failed = fail_count, "Thumbnail generation completed");
 
     // Phase 3: Save thumbnails and insert into database
     let mut uploaded_items = Vec::new();
@@ -509,6 +534,8 @@ async fn upload_image(
             Json(ApiResponse::error("Failed to commit database transaction")),
         );
     }
+
+    tracing::info!(%batch_id, total_uploaded = uploaded_items.len(), "Bulk upload finished");
 
     if num_files == 1 {
         let single_item = uploaded_items.into_iter().next().unwrap();
