@@ -1339,7 +1339,7 @@ async fn update_image_pinned(
                 }
 
                 // Get max pin_order and assign next value
-                let max_order_result: Result<Option<(i32,)>, _> = sqlx::query_as(
+                let max_order_result: Result<Option<(Option<i32>,)>, _> = sqlx::query_as(
                     "SELECT MAX(pin_order) FROM gallery WHERE user_id = ? AND pinned = TRUE"
                 )
                 .bind(auth_user.id)
@@ -1347,8 +1347,8 @@ async fn update_image_pinned(
                 .await;
 
                 let new_pin_order = match max_order_result {
-                    Ok(Some((max_order,))) => max_order + 1,
-                    Ok(None) => 1,
+                    Ok(Some((Some(max_order),))) => max_order + 1,
+                    Ok(Some((None,))) | Ok(None) => 1,
                     Err(e) => {
                         tracing::error!("Failed to get max pin_order: {:?}", e);
                         return (
