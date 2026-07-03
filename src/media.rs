@@ -228,6 +228,59 @@ pub fn generate_preview_path(original_stored_path: &str) -> String {
     format!("{}-preview.webp", path_without_ext)
 }
 
+/// Generate thumbnail and preview from image bytes in one pass (optimized)
+/// - Decodes image ONCE (most expensive operation)
+/// - Creates preview from decoded image
+/// - Creates thumbnail from preview (cascading resize - faster!)
+/// Returns: (thumbnail_bytes, preview_bytes)
+pub fn generate_thumbnail_and_preview(image_data: &[u8]) -> Result<(Vec<u8>, Vec<u8>), String> {
+    use image::{GenericImageView, ImageReader};
+    use std::io::Cursor;
+    
+    // DECODE ONCE - Most expensive operation!
+    let img = ImageReader::new(Cursor::new(image_data))
+        .with_guessed_format()
+        .map_err(|e| format!("Failed to detect image format: {}", e))?
+        .decode()
+        .map_err(|e| format!("Failed to decode image: {}", e))?;
+    
+    let (orig_width, orig_height) = img.dimensions();
+    
+    // === PREVIEW: Resize from original (1280px max) ===
+    let preview_img = if orig_width > 1280 {
+        let ratio = 1280.0 / orig_width as f32;
+        let new_height = (orig_height as f32 * ratio) as u32;
+        img.resize(1280, new_height, image::imageops::FilterType::Lanczos3)
+    } else {
+        img.clone() // Keep original if already smaller
+    };
+    
+    // Encode preview to WebP (quality 85)
+    let preview_rgba = preview_img.to_rgba8();
+    let (preview_width, preview_height) = (preview_rgba.width(), preview_rgba.height());
+    let preview_encoder = webp::Encoder::from_rgba(&preview_rgba, preview_width, preview_height);
+    let preview_encoded = preview_encoder.encode(85.0);
+    
+    // === THUMBNAIL: Cascading resize from preview (500px max) ===
+    // This is MUCH faster than resizing from original 4000px image!
+    let (preview_w, preview_h) = preview_img.dimensions();
+    let thumb_img = if preview_w > 500 {
+        let ratio = 500.0 / preview_w as f32;
+        let new_height = (preview_h as f32 * ratio) as u32;
+        preview_img.resize(500, new_height, image::imageops::FilterType::Lanczos3)
+    } else {
+        preview_img // Already small enough
+    };
+    
+    // Encode thumbnail to WebP (quality 80)
+    let thumb_rgba = thumb_img.to_rgba8();
+    let (thumb_width, thumb_height) = (thumb_rgba.width(), thumb_rgba.height());
+    let thumb_encoder = webp::Encoder::from_rgba(&thumb_rgba, thumb_width, thumb_height);
+    let thumb_encoded = thumb_encoder.encode(80.0);
+    
+    Ok((thumb_encoded.to_vec(), preview_encoded.to_vec()))
+}
+
 /// Generate thumbnail from image bytes
 /// - Max width: 500px (proportional resize, aspect ratio maintained)
 /// - Format: WebP lossy with quality 80
