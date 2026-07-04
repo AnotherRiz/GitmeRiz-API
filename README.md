@@ -15,12 +15,14 @@ A Rust backend API built with Axum, Tokio, and MySQL, featuring JWT authenticati
 
 ```
 src/
-├── main.rs          # Application entry point
+├── main.rs          # Application entry point, router setup
 ├── config.rs        # Environment configuration
 ├── db.rs            # Database connection and migrations
 ├── models.rs        # Data structures, roles, and API response types
 ├── auth.rs          # Password hashing and JWT utilities
 ├── middleware.rs    # Authentication middleware
+├── media.rs         # Media file utilities (paths, validation, image processing)
+├── error_page.rs    # HTML/JSON error responses (content negotiation)
 └── handlers/
     ├── mod.rs       # Handler module exports
     ├── health.rs    # Health check endpoint
@@ -31,6 +33,8 @@ src/
     ├── blog.rs      # Blog post endpoints
     ├── notes.rs     # Notes endpoints
     └── clipboard.rs # Clipboard endpoints
+
+api-docs/            # Full API reference (see "API Documentation" below)
 ```
 
 ## Roles & Permissions
@@ -88,61 +92,57 @@ src/
 
 The server will start at `http://localhost:3000`. All tables are created automatically on startup.
 
-## API Endpoints
+## API Documentation
+
+Full API reference lives in the [`api-docs/`](api-docs/README.md) folder, split by resource for
+easy reading:
+
+| Document | Description |
+|----------|-------------|
+| [Overview & Index](api-docs/README.md) | Entry point with links to everything |
+| [Conventions](api-docs/conventions.md) | Response envelope, status codes, auth flow, roles, file storage |
+| [Authentication](api-docs/authentication.md) | Register, login, logout |
+| [Users](api-docs/users.md) | User management |
+| [Gallery](api-docs/gallery.md) | Image upload, background processing, thumbnails/previews, pinning, signed URLs |
+| [Video](api-docs/video.md) | Video upload and management |
+| [Audio](api-docs/audio.md) | Audio upload and management |
+| [Blog](api-docs/blog.md) | Blog post CRUD |
+| [Notes](api-docs/notes.md) | Personal notes CRUD |
+| [Clipboard](api-docs/clipboard.md) | Clipboard items CRUD |
+| [Health](api-docs/health.md) | Health check |
+| [Endpoint Summary](api-docs/endpoint-summary.md) | Complete table of all endpoints |
+
+## API Endpoints (Overview)
+
+A high-level summary. See the [full documentation](api-docs/README.md) for request/response
+details, error cases, and examples.
 
 ### Public (No Auth Required)
 - `GET /health` — Health check
 - `POST /register` — Register a new user (default role: `user`)
-- `POST /login` — Login and receive JWT token
+- `POST /login` — Login; sets an `auth_token` cookie and returns a JWT
+- `POST /logout` — Clear the `auth_token` cookie
+- `GET /gallery/public` — List all public images
+- `GET /gallery/{id}` — Get image metadata
+- `GET /gallery/d/{id}` — Download image file
+- `GET /gallery/r|t|p/{short_id}` — Serve raw / thumbnail / preview image (public, or private via signed URL)
 
 ### Protected (Auth Required)
-All protected endpoints require the `Authorization: Bearer <token>` header.
+Authenticated via the `auth_token` cookie (preferred) or an `Authorization: Bearer <token>` header.
 
-#### Users
-- `GET /users/me` — Get current user
-- `GET /users` — List all users (superuser only)
-- `GET /users/:id` — Get user by ID
-- `PUT /users/:id` — Update user
-- `DELETE /users/:id` — Delete user (superuser only)
+- **Users** — `GET /users/me`, `GET /users` (superuser), `GET|PUT /users/{id}`, `DELETE /users/{id}` (superuser)
+- **Gallery** — `POST /gallery` (upload, returns `202`, processes in background), `GET /gallery/me`,
+  `GET /gallery/me/pinned`, `POST /gallery/status`, `PATCH /gallery/{id}/title|visibility|pinned`,
+  `PATCH /gallery/reorder-pins`, `POST /gallery/{id}/reprocess`, `POST /gallery/{short_id}/sign`, `DELETE /gallery/{id}`
+- **Video** — `GET /video`, `POST /video`, `GET /video/{id}`, `GET /video/{id}/download`, `DELETE /video/{id}`
+- **Audio** — `GET /audio`, `POST /audio`, `GET /audio/{id}`, `GET /audio/{id}/download`, `DELETE /audio/{id}`
+- **Blog** — `GET /blog`, `POST /blog` (admin/superuser), `GET /blog/{id}`, `PUT|DELETE /blog/{id}` (admin/superuser)
+- **Notes** — `GET|POST /notes`, `GET|PUT|DELETE /notes/{id}`
+- **Clipboard** — `GET|POST /clipboard`, `GET|PUT|DELETE /clipboard/{id}`
 
-#### Gallery (Images)
-- `GET /gallery` — List images (own images, or all for superuser)
-- `POST /gallery` — Upload image
-- `GET /gallery/:id` — Get image
-- `DELETE /gallery/:id` — Delete image
-
-#### Video
-- `GET /video` — List videos (own videos, or all for superuser)
-- `POST /video` — Upload video
-- `GET /video/:id` — Get video
-- `DELETE /video/:id` — Delete video
-
-#### Audio
-- `GET /audio` — List audio (own audio, or all for superuser)
-- `POST /audio` — Upload audio
-- `GET /audio/:id` — Get audio
-- `DELETE /audio/:id` — Delete audio
-
-#### Blog
-- `GET /blog` — List published posts (all roles)
-- `POST /blog` — Create post (admin/superuser only)
-- `GET /blog/:id` — Get post
-- `PUT /blog/:id` — Update post (admin/superuser only)
-- `DELETE /blog/:id` — Delete post (admin/superuser only)
-
-#### Notes
-- `GET /notes` — List own notes
-- `POST /notes` — Create note
-- `GET /notes/:id` — Get note
-- `PUT /notes/:id` — Update note
-- `DELETE /notes/:id` — Delete note
-
-#### Clipboard
-- `GET /clipboard` — List own clipboard items
-- `POST /clipboard` — Create clipboard item
-- `GET /clipboard/:id` — Get clipboard item
-- `PUT /clipboard/:id` — Update clipboard item
-- `DELETE /clipboard/:id` — Delete clipboard item
+> Gallery uploads use **background processing**: the upload endpoint returns `202 Accepted`
+> immediately, then generates thumbnails and previews asynchronously. See
+> [Gallery docs](api-docs/gallery.md) for the full workflow.
 
 ## Request/Response Examples
 
@@ -202,7 +202,13 @@ Or on error:
 ```
 
 ## Error Codes
+- `400 Bad Request` — Invalid input or validation error
 - `401 Unauthorized` — Missing or invalid token
 - `403 Forbidden` — Insufficient permissions for the action
 - `404 Not Found` — Resource not found
+- `413 Payload Too Large` — Uploaded image exceeds the 100 MB limit
+- `500 Internal Server Error` — Server or database error
+
+See [Conventions → Status Codes](api-docs/conventions.md#status-codes) for the full list,
+including `202 Accepted` used by gallery uploads.
 
