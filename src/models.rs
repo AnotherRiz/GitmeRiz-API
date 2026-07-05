@@ -12,6 +12,7 @@ pub enum Role {
 }
 
 impl Role {
+    #[allow(dead_code)]
     pub fn as_str(&self) -> &'static str {
         match self {
             Role::Superuser => "superuser",
