@@ -213,16 +213,31 @@ pub fn generate_thumbnail_path(original_stored_path: &str) -> String {
     format!("{}-thumb.webp", path_without_ext)
 }
 
-/// Generate thumbnail from image bytes
-/// - Max width: 500-600px (proportional resize, aspect ratio maintained)
-/// - Format: WebP with 80% quality
-/// - Returns: WebP bytes
-pub fn generate_and_encode_thumbnail(image_data: &[u8], max_width: u32) -> Result<Vec<u8>, String> {
-    use image::codecs::webp::WebPEncoder;
+/// Generate preview path from original stored path
+/// Converts: gallery/2026/07/2026-07-01/2026-07-01_15-15-01_UUID.png
+/// To:       gallery/2026/07/2026-07-01/2026-07-01_15-15-01_UUID-preview.webp
+pub fn generate_preview_path(original_stored_path: &str) -> String {
+    // Remove extension from original path
+    let path_without_ext = if let Some(pos) = original_stored_path.rfind('.') {
+        &original_stored_path[..pos]
+    } else {
+        original_stored_path
+    };
+    
+    // Append -preview.webp
+    format!("{}-preview.webp", path_without_ext)
+}
+
+/// Generate thumbnail and preview from image bytes in one pass (optimized)
+/// - Decodes image ONCE (most expensive operation)
+/// - Creates preview from decoded image
+/// - Creates thumbnail from preview (cascading resize - faster!)
+/// Returns: (thumbnail_bytes, preview_bytes)
+pub fn generate_thumbnail_and_preview(image_data: &[u8]) -> Result<(Vec<u8>, Vec<u8>), String> {
     use image::{GenericImageView, ImageReader};
     use std::io::Cursor;
     
-    // Load image from bytes
+    // DECODE ONCE - Most expensive operation!
     let img = ImageReader::new(Cursor::new(image_data))
         .with_guessed_format()
         .map_err(|e| format!("Failed to detect image format: {}", e))?
@@ -231,26 +246,37 @@ pub fn generate_and_encode_thumbnail(image_data: &[u8], max_width: u32) -> Resul
     
     let (orig_width, orig_height) = img.dimensions();
     
-    // Calculate new dimensions (aspect ratio preserved)
-    let (new_width, new_height) = if orig_width > max_width {
-        let ratio = max_width as f32 / orig_width as f32;
+    // === PREVIEW: Resize from original (1280px max) ===
+    let preview_img = if orig_width > 1280 {
+        let ratio = 1280.0 / orig_width as f32;
         let new_height = (orig_height as f32 * ratio) as u32;
-        (max_width, new_height)
+        img.resize(1280, new_height, image::imageops::FilterType::Lanczos3)
     } else {
-        // Image already smaller than max_width, keep original size
-        (orig_width, orig_height)
+        img.clone() // Keep original if already smaller
     };
     
-    // Resize image
-    let resized = img.resize(new_width, new_height, image::imageops::FilterType::Lanczos3);
+    // Encode preview to WebP (quality 85)
+    let preview_rgba = preview_img.to_rgba8();
+    let (preview_width, preview_height) = (preview_rgba.width(), preview_rgba.height());
+    let preview_encoder = webp::Encoder::from_rgba(&preview_rgba, preview_width, preview_height);
+    let preview_encoded = preview_encoder.encode(85.0);
     
-    // Encode to WebP lossy with quality 80
-    let mut buffer = Vec::new();
-    let encoder = WebPEncoder::new_lossless(&mut buffer);
+    // === THUMBNAIL: Cascading resize from preview (500px max) ===
+    // This is MUCH faster than resizing from original 4000px image!
+    let (preview_w, preview_h) = preview_img.dimensions();
+    let thumb_img = if preview_w > 500 {
+        let ratio = 500.0 / preview_w as f32;
+        let new_height = (preview_h as f32 * ratio) as u32;
+        preview_img.resize(500, new_height, image::imageops::FilterType::Lanczos3)
+    } else {
+        preview_img // Already small enough
+    };
     
-    resized
-        .write_with_encoder(encoder)
-        .map_err(|e| format!("Failed to encode WebP: {}", e))?;
+    // Encode thumbnail to WebP (quality 80)
+    let thumb_rgba = thumb_img.to_rgba8();
+    let (thumb_width, thumb_height) = (thumb_rgba.width(), thumb_rgba.height());
+    let thumb_encoder = webp::Encoder::from_rgba(&thumb_rgba, thumb_width, thumb_height);
+    let thumb_encoded = thumb_encoder.encode(80.0);
     
-    Ok(buffer)
+    Ok((thumb_encoded.to_vec(), preview_encoded.to_vec()))
 }
