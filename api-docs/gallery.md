@@ -96,51 +96,95 @@ optional `preview_path`, a `pinned` flag, a `pin_order`, and a `status`.
 
 ## GET /gallery/public
 
-Lists all **public** images, newest first. Public endpoint.
+Lists all **public** images with **cursor-based pagination**, newest first. Public endpoint.
+
+**Query Parameters:**
+- `cursor` (optional): The `id` of the last item from the previous page. Omit on the first request.
+- `limit` (optional): Number of items per page. Defaults to `50`. Maximum `100`.
+
+**Example:** `GET /gallery/public?cursor=1450&limit=20`
+
+**Pagination behavior:**
+- Results are ordered by `id DESC` (newest first).
+- The first request (no `cursor`) returns the first page.
+- Each response includes `next_cursor` — use it as `?cursor={next_cursor}` for the next page.
+- When `next_cursor` is `null`, you've reached the end.
+- Ideal for infinite-scroll masonry grids on the frontend.
 
 Response `200`:
 ```json
 {
   "success": true,
-  "data": [
-    {
-      "id": 1,
-      "user_id": 1,
-      "title": "Sunset",
-      "original_filename": "sunset.jpg",
-      "stored_path": "gallery/2026/06/2026-06-30/2026-06-30_14-23-05_550e8400-e29b-41d4-a716-446655440000.jpg",
-      "size_bytes": 482931,
-      "mime_type": "image/jpeg",
-      "visibility": "public",
-      "short_id": "aB3xYz9Q",
-      "thumbnail_path": "gallery/2026/06/2026-06-30/2026-06-30_14-23-05_550e8400-e29b-41d4-a716-446655440000-thumb.webp",
-      "preview_path": "gallery/2026/06/2026-06-30/2026-06-30_14-23-05_550e8400-e29b-41d4-a716-446655440000-preview.webp",
-      "pinned": false,
-      "status": "active",
-      "pin_order": 0
-    }
-  ]
+  "data": {
+    "items": [
+      {
+        "id": 1,
+        "user_id": 1,
+        "title": "Sunset",
+        "original_filename": "sunset.jpg",
+        "stored_path": "gallery/2026/06/2026-06-30/2026-06-30_14-23-05_550e8400-e29b-41d4-a716-446655440000.jpg",
+        "size_bytes": 482931,
+        "mime_type": "image/jpeg",
+        "visibility": "public",
+        "short_id": "aB3xYz9Q",
+        "thumbnail_path": "gallery/2026/06/2026-06-30/2026-06-30_14-23-05_550e8400-e29b-41d4-a716-446655440000-thumb.webp",
+        "preview_path": "gallery/2026/06/2026-06-30/2026-06-30_14-23-05_550e8400-e29b-41d4-a716-446655440000-preview.webp",
+        "pinned": false,
+        "status": "active",
+        "pin_order": 0
+      }
+    ],
+    "next_cursor": 450,
+    "limit": 50
+  }
 }
 ```
 
+**Notes:**
+- `next_cursor` is `null` when there are no more items.
+- `limit` is clamped to a maximum of 100 to protect server performance.
+
 ```bash
-curl http://localhost:3000/gallery/public
+# First page
+curl http://localhost:3000/gallery/public?limit=20
+
+# Next page
+curl "http://localhost:3000/gallery/public?cursor=450&limit=20"
 ```
 
 ## GET /gallery/me
 
-Lists the current user's images (both public and private), newest first. **Requires authentication.**
+Lists the current user's images (both public and private) with **cursor-based pagination**, newest first. **Requires authentication.**
 
-Response `200`: array of gallery items (same shape as above).
+**Query Parameters:**
+- `cursor` (optional): The `id` of the last item from the previous page. Omit on the first request.
+- `limit` (optional): Number of items per page. Defaults to `50`. Maximum `100`.
+
+**Example:** `GET /gallery/me?cursor=1450&limit=20`
+
+Response `200`: Same pagination envelope as `GET /gallery/public`, but scoped to the authenticated user's images only.
+
+```json
+{
+  "success": true,
+  "data": {
+    "items": [ /* user's GalleryItem[] */ ],
+    "next_cursor": 320,
+    "limit": 50
+  }
+}
+```
 
 ```bash
-curl http://localhost:3000/gallery/me \
+curl "http://localhost:3000/gallery/me?limit=20" \
   -H "Authorization: Bearer <token>"
 ```
 
 ## GET /gallery/me/pinned
 
 Lists the current user's **pinned** images, ordered by `pin_order ASC, updated_at DESC` (i.e. user's saved order, with newly pinned items at the end). **Requires authentication.**
+
+**This endpoint does NOT use pagination** — pinned images are limited to 8 per user, so the response is always small.
 
 Response `200`: array of gallery items where `pinned` is `true`, ordered by `pin_order`.
 
@@ -368,71 +412,85 @@ curl -X POST http://localhost:3000/gallery/xYz9QaB3/sign \
   -H "Authorization: Bearer <token>"
 ```
 
-## PATCH /gallery/{id}/title
+## PATCH /gallery/{id}
 
-Updates an image's title. **Requires authentication.** Owner or superuser only.
+Unified partial update endpoint for gallery images. Updates any combination of **title**, **visibility**, and **pinned** status in a single request. **Requires authentication.** Owner or superuser only.
 
-Request body:
+**All fields are optional** — only send the fields you want to change.
+
+Request body (all fields optional):
 ```json
-{ "title": "Beautiful Sunset" }
+{
+  "title": "Beautiful Sunset",
+  "visibility": "public",
+  "pinned": true
+}
 ```
 
-Response `200`: the updated gallery item.
+Or update just one field:
+```json
+{ "title": "New Title" }
+```
+
+**Field validation rules:**
+- `title`: Must not be empty or whitespace. If provided → `400` if empty.
+- `visibility`: Must be `public` or `private` (case-insensitive). If provided → `400` if invalid.
+- `pinned`: Applies the following logic:
+  - **Pinning** (when `pinned: true` and image is not already pinned):
+    - Checks if user already has 8 pinned images. If so → `400`.
+    - Assigns `pin_order = MAX(current_pin_order) + 1` (appends to end of pinned list).
+  - **Unpinning** (when `pinned: false` and image is pinned):
+    - Sets `pin_order = 0` (removes from ordered list).
+  - No change if `pinned` value matches current state.
+
+Response `200`: the updated gallery item with all changes applied.
+
+```json
+{
+  "success": true,
+  "data": {
+    "id": 1,
+    "title": "Beautiful Sunset",
+    "visibility": "public",
+    "pinned": true,
+    "pin_order": 3,
+    ...
+  }
+}
+```
 
 Errors:
-- `400` — title is empty.
+- `400` — no fields provided, or validation failed (empty title, invalid visibility, max pins exceeded).
 - `403` — not the owner and not a superuser.
 - `404` — image not found.
 
-## PATCH /gallery/{id}/visibility
-
-Changes an image's visibility between `public` and `private`. **Requires authentication.** Owner or superuser only.
-
-Request body:
-```json
-{ "visibility": "public" }
-```
-
-Response `200`: the updated gallery item.
-
-Errors:
-- `400` — visibility is not `public` or `private`.
-- `403` — not the owner and not a superuser.
-- `404` — image not found.
-
-## PATCH /gallery/{id}/pinned
-
-Sets or clears an image's `pinned` flag. **Requires authentication.** Owner or superuser only.
-
-**Pinning behavior:**
-- When `pinned: true` is requested and the image is not already pinned:
-  - Checks if user already has 8 pinned images. If so, returns `400 Bad Request`.
-  - Assigns `pin_order = MAX(current_pin_order) + 1` (appends to the end of pinned list).
-- When `pinned: false` is requested:
-  - Sets `pin_order = 0` (removes from ordered list).
-
-Request body:
-```json
-{ "pinned": true }
-```
-
-Response `200`: the updated gallery item (with the new `pinned` value and `pin_order`).
-
-Errors:
-- `400` — user already has 8 pinned images (when trying to pin a 9th).
-- `403` — not the owner and not a superuser.
-- `404` — image not found.
+**Examples:**
 
 ```bash
-curl -X PATCH http://localhost:3000/gallery/1/pinned \
+# Update title and visibility
+curl -X PATCH http://localhost:3000/gallery/1 \
   -H "Authorization: Bearer <token>" \
   -H "Content-Type: application/json" \
-  -d '{"pinned": true}'
+  -d '{"title":"New Title","visibility":"public"}'
+
+# Pin an image
+curl -X PATCH http://localhost:3000/gallery/1 \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{"pinned":true}'
+
+# Update all three fields at once
+curl -X PATCH http://localhost:3000/gallery/1 \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{"title":"Updated","visibility":"private","pinned":false}'
 ```
 
 ## PATCH /gallery/reorder-pins
 
 Persists a new order for the current user's pinned images. Used to save drag-and-drop reordering from the frontend. **Requires authentication.** Owner or superuser only.
+
+**Note:** This endpoint is separate from `PATCH /gallery/{id}` because it operates across multiple images transactionally.
 
 Request body:
 ```json
@@ -492,29 +550,23 @@ curl -X DELETE http://localhost:3000/gallery/1 \
 Retries thumbnail **and preview** generation for an image. Useful when an upload's background
 processing failed (status = `failed_processing`). **Requires authentication.** Owner or superuser only.
 
-Unlike the upload endpoint, reprocessing runs **synchronously** and returns the finished item.
+Reprocessing uses the **same async background pattern as upload** — returns `202 Accepted` immediately,
+then processes in the background.
 
 **Process:**
-1. Verifies the image exists and the user has permission.
-2. Reads the original raw file from disk (must exist).
+1. Verifies the image exists and the user has permission (synchronous checks before queuing).
+2. Confirms the original raw file exists on disk (must exist).
 3. Sets status to `processing`.
-4. Generates the thumbnail and preview from a single decode (non-blocking, respects the semaphore memory ceiling).
-5. On success: saves both files in parallel, updates status to `active`, returns the updated item.
-6. On failure: updates status to `failed_processing`, returns an error.
+4. **Returns `202 Accepted` immediately** with the item in `processing` status.
+5. In the background: acquires a semaphore permit, generates thumbnail and preview from a single decode (non-blocking), saves both files in parallel, and updates status to `active` (or `failed_processing` on error).
 
-Response `200`: the updated gallery item with `status: "active"`, and `thumbnail_path` / `preview_path` set.
+**Client workflow:**
+- Poll `POST /gallery/status` with the image `id` to check when reprocessing finishes.
+- When status becomes `active`, the thumbnail and preview are ready.
+- If status becomes `failed_processing`, reprocessing failed again.
 
-Errors:
-- `403` — not the owner and not a superuser.
-- `404` — image not found, or raw file missing from disk.
-- `500` — image processing failed (corrupt file, decode error, etc.).
+Response `202 Accepted`: the gallery item with `status: "processing"`. Background processing continues.
 
-```bash
-curl -X POST http://localhost:3000/gallery/1/reprocess \
-  -H "Authorization: Bearer <token>"
-```
-
-Example response (success):
 ```json
 {
   "success": true,
@@ -528,19 +580,26 @@ Example response (success):
     "mime_type": "image/jpeg",
     "visibility": "public",
     "short_id": "aB3xYz9Q",
-    "thumbnail_path": "gallery/2026/06/2026-06-30/2026-06-30_14-23-05_550e8400-e29b-41d4-a716-446655440000-thumb.webp",
-    "preview_path": "gallery/2026/06/2026-06-30/2026-06-30_14-23-05_550e8400-e29b-41d4-a716-446655440000-preview.webp",
     "pinned": false,
-    "status": "active",
+    "status": "processing",
     "pin_order": 0
   }
 }
 ```
 
-Example response (failure):
-```json
-{
-  "success": false,
-  "error": "Failed to generate thumbnail and preview: unsupported image format"
-}
+Note: `thumbnail_path` and `preview_path` are omitted (null) until background processing completes.
+
+Errors (returned synchronously before queuing):
+- `403` — not the owner and not a superuser.
+- `404` — image not found, or raw file missing from disk.
+
+```bash
+curl -X POST http://localhost:3000/gallery/1/reprocess \
+  -H "Authorization: Bearer <token>"
+
+# Then poll status
+curl -X POST http://localhost:3000/gallery/status \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{"ids":[1]}'
 ```
