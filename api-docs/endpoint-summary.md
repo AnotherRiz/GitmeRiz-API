@@ -14,9 +14,9 @@
 | PATCH | `/users/{id}` | Yes | Partial profile update: name/username/email (self or superuser) - validates input, no password/role |
 | PATCH | `/users/me/password` | Yes | Change password - requires current password verification |
 | DELETE | `/users/{id}` | Yes | Delete user (superuser) |
-| GET | `/gallery/public` | No | List all public images |
-| GET | `/gallery/me` | Yes | List current user's images (public & private) |
-| GET | `/gallery/me/pinned` | Yes | List current user's pinned images |
+| GET | `/gallery/public` | No | List all public images with cursor pagination - supports `?cursor={id}&limit=50` |
+| GET | `/gallery/me` | Yes | List current user's images (public & private) with cursor pagination - supports `?cursor={id}&limit=50` |
+| GET | `/gallery/me/pinned` | Yes | List current user's pinned images (no pagination, max 8) |
 | POST | `/gallery` | Yes | Upload image(s) (multipart, max 100 MB, up to 50 files); returns `202`, processes in background |
 | POST | `/gallery/status` | Yes | Check processing status of up to 100 image ids (own only) |
 | GET | `/gallery/{id}` | No | Get image metadata by numeric id (public) |
@@ -25,11 +25,9 @@
 | GET | `/gallery/t/{short_id}` | Optional | Serve pre-generated thumbnail inline (WebP lossy, cached 1 year) |
 | GET | `/gallery/p/{short_id}` | Optional | Serve pre-generated medium preview inline (WebP lossy, cached 1 hour) |
 | POST | `/gallery/{short_id}/sign` | Yes | Generate signed URL for private image (15 min expiry, owner/superuser only) |
-| PATCH | `/gallery/{id}/title` | Yes | Update image title (owner / superuser) |
-| PATCH | `/gallery/{id}/visibility` | Yes | Change visibility public/private (owner / superuser) |
-| PATCH | `/gallery/{id}/pinned` | Yes | Pin/unpin image (max 8 per user, assigns pin_order) (owner / superuser) |
+| PATCH | `/gallery/{id}` | Yes | Unified partial update: title/visibility/pinned (optional fields, owner/superuser) |
 | PATCH | `/gallery/reorder-pins` | Yes | Persist custom order for pinned images (drag-and-drop support) (owner / superuser) |
-| POST | `/gallery/{id}/reprocess` | Yes | Retry thumbnail + preview generation, synchronous (owner / superuser) |
+| POST | `/gallery/{id}/reprocess` | Yes | Retry thumbnail + preview generation - returns `202`, processes in background, poll `/gallery/status` (owner / superuser) |
 | DELETE | `/gallery/{id}` | Yes | Delete image + file (owner / superuser) |
 | GET | `/video` | Yes | List videos (own / all for superuser) |
 | POST | `/video` | Yes | Upload video (multipart, no size limit) |

@@ -4,7 +4,7 @@ use axum::{
     extract::{Multipart, Path, Query, State},
     http::{header, HeaderMap, Response, StatusCode},
     response::IntoResponse,
-    routing::{delete, get, post, patch},
+    routing::{get, patch, post},
     Extension, Json, Router,
 };
 use chrono::Utc;
@@ -51,18 +51,23 @@ pub enum UploadResponse {
 }
 
 #[derive(Debug, Deserialize)]
-struct UpdateTitleRequest {
-    title: String,
+struct GalleryPageQuery {
+    cursor: Option<i32>,
+    limit: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+struct GalleryPageResponse {
+    items: Vec<GalleryItem>,
+    next_cursor: Option<i32>,
+    limit: i64,
 }
 
 #[derive(Debug, Deserialize)]
-struct UpdatePinnedRequest {
-    pinned: bool,
-}
-
-#[derive(Debug, Deserialize)]
-struct UpdateVisibilityRequest {
-    visibility: String,
+struct UpdateGalleryRequest {
+    title: Option<String>,
+    visibility: Option<String>,
+    pinned: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -148,10 +153,7 @@ pub fn protected_routes() -> Router<Arc<AppState>> {
         .route("/gallery/me/pinned", get(list_pinned_gallery))
         .route("/gallery/status", post(check_status))
         .route("/gallery/reorder-pins", patch(reorder_pins))
-        .route("/gallery/{id}", delete(delete_image))
-        .route("/gallery/{id}/title", patch(update_image_title))
-        .route("/gallery/{id}/visibility", patch(update_image_visibility))
-        .route("/gallery/{id}/pinned", patch(update_image_pinned))
+        .route("/gallery/{id}", patch(update_gallery).delete(delete_image))
         .route("/gallery/{id}/reprocess", post(reprocess_image))
         .route("/gallery/{short_id}/sign", post(generate_signed_url))
 }
@@ -199,18 +201,60 @@ fn extract_optional_auth(
     None
 }
 
-// GET /api/gallery - List all public images
+// GET /api/gallery - List all public images with cursor-based pagination
 async fn list_gallery(
     State(state): State<Arc<AppState>>,
-) -> (StatusCode, Json<ApiResponse<Vec<GalleryItem>>>) {
-    let items: Result<Vec<GalleryItem>, _> = sqlx::query_as(
-        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, preview_path, pinned, status, pin_order FROM gallery WHERE visibility = 'public' ORDER BY id DESC",
-    )
-    .fetch_all(&state.db.pool)
-    .await;
+    Query(query): Query<GalleryPageQuery>,
+) -> (StatusCode, Json<ApiResponse<GalleryPageResponse>>) {
+    // Parse and validate pagination params
+    let limit = query.limit.unwrap_or(50).clamp(1, 100);
+    let fetch_limit = limit + 1; // Fetch one extra to detect if there's a next page
+
+    // Build query based on cursor presence
+    let items: Result<Vec<GalleryItem>, _> = if let Some(cursor) = query.cursor {
+        sqlx::query_as(
+            "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, preview_path, pinned, status, pin_order 
+             FROM gallery 
+             WHERE visibility = 'public' AND id < ? 
+             ORDER BY id DESC 
+             LIMIT ?",
+        )
+        .bind(cursor)
+        .bind(fetch_limit)
+        .fetch_all(&state.db.pool)
+        .await
+    } else {
+        sqlx::query_as(
+            "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, preview_path, pinned, status, pin_order 
+             FROM gallery 
+             WHERE visibility = 'public' 
+             ORDER BY id DESC 
+             LIMIT ?",
+        )
+        .bind(fetch_limit)
+        .fetch_all(&state.db.pool)
+        .await
+    };
 
     match items {
-        Ok(items) => (StatusCode::OK, Json(ApiResponse::success(items))),
+        Ok(mut items) => {
+            // Determine if there's a next page
+            let has_more = items.len() as i64 > limit;
+            let next_cursor = if has_more {
+                items.pop(); // Remove the extra item
+                items.last().map(|item| item.id)
+            } else {
+                None
+            };
+
+            let response = GalleryPageResponse {
+                items,
+                next_cursor,
+                limit,
+            };
+
+            (StatusCode::OK, Json(ApiResponse::success(response)))
+        }
         Err(e) => {
             tracing::error!("Failed to fetch gallery items: {:?}", e);
             (
@@ -221,20 +265,63 @@ async fn list_gallery(
     }
 }
 
-// GET /api/gallery/my - List all user-specific images (public & private)
+// GET /api/gallery/my - List all user-specific images (public & private) with cursor-based pagination
 async fn list_my_gallery(
     Extension(auth_user): Extension<AuthUser>,
     State(state): State<Arc<AppState>>,
-) -> (StatusCode, Json<ApiResponse<Vec<GalleryItem>>>) {
-    let items: Result<Vec<GalleryItem>, _> = sqlx::query_as(
-        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, preview_path, pinned, status, pin_order FROM gallery WHERE user_id = ? ORDER BY id DESC",
-    )
-    .bind(auth_user.id)
-    .fetch_all(&state.db.pool)
-    .await;
+    Query(query): Query<GalleryPageQuery>,
+) -> (StatusCode, Json<ApiResponse<GalleryPageResponse>>) {
+    // Parse and validate pagination params
+    let limit = query.limit.unwrap_or(50).clamp(1, 100);
+    let fetch_limit = limit + 1; // Fetch one extra to detect if there's a next page
+
+    // Build query based on cursor presence
+    let items: Result<Vec<GalleryItem>, _> = if let Some(cursor) = query.cursor {
+        sqlx::query_as(
+            "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, preview_path, pinned, status, pin_order 
+             FROM gallery 
+             WHERE user_id = ? AND id < ? 
+             ORDER BY id DESC 
+             LIMIT ?",
+        )
+        .bind(auth_user.id)
+        .bind(cursor)
+        .bind(fetch_limit)
+        .fetch_all(&state.db.pool)
+        .await
+    } else {
+        sqlx::query_as(
+            "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, preview_path, pinned, status, pin_order 
+             FROM gallery 
+             WHERE user_id = ? 
+             ORDER BY id DESC 
+             LIMIT ?",
+        )
+        .bind(auth_user.id)
+        .bind(fetch_limit)
+        .fetch_all(&state.db.pool)
+        .await
+    };
 
     match items {
-        Ok(items) => (StatusCode::OK, Json(ApiResponse::success(items))),
+        Ok(mut items) => {
+            // Determine if there's a next page
+            let has_more = items.len() as i64 > limit;
+            let next_cursor = if has_more {
+                items.pop(); // Remove the extra item
+                items.last().map(|item| item.id)
+            } else {
+                None
+            };
+
+            let response = GalleryPageResponse {
+                items,
+                next_cursor,
+                limit,
+            };
+
+            (StatusCode::OK, Json(ApiResponse::success(response)))
+        }
         Err(e) => {
             tracing::error!("Failed to fetch user gallery items: {:?}", e);
             (
@@ -663,77 +750,31 @@ async fn download_image(
 }
 
 // PATCH /api/gallery/:id/title - Rename image (owner or superuser)
-async fn update_image_title(
-    Extension(auth_user): Extension<AuthUser>,
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<i32>,
-    Json(payload): Json<UpdateTitleRequest>,
-) -> (StatusCode, Json<ApiResponse<GalleryItem>>) {
-    if payload.title.trim().is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ApiResponse::error("Title cannot be empty")),
-        );
-    }
-
-    let item: Result<GalleryItem, _> = sqlx::query_as(
-        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, preview_path, pinned, status, pin_order FROM gallery WHERE id = ?",
-    )
-    .bind(id)
-    .fetch_one(&state.db.pool)
-    .await;
-
-    match item {
-        Ok(mut item) => {
-            if item.user_id != auth_user.id && !auth_user.is_superuser() {
-                return (
-                    StatusCode::FORBIDDEN,
-                    Json(ApiResponse::error("You can only edit your own images")),
-                );
-            }
-
-            let result = sqlx::query("UPDATE gallery SET title = ? WHERE id = ?")
-                .bind(&payload.title)
-                .bind(id)
-                .execute(&state.db.pool)
-                .await;
-
-            match result {
-                Ok(_) => {
-                    item.title = payload.title;
-                    (StatusCode::OK, Json(ApiResponse::success(item)))
-                }
-                Err(e) => {
-                    tracing::error!("Failed to update image title: {:?}", e);
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(ApiResponse::error("Failed to update image title")),
-                    )
-                }
-            }
-        }
-        Err(_) => (
-            StatusCode::NOT_FOUND,
-            Json(ApiResponse::error("Image not found")),
-        ),
-    }
-}
+// DEPRECATED: Use unified PATCH /gallery/{id} instead
+// This handler is kept temporarily for backwards compatibility but will be removed
 
 // PATCH /api/gallery/:id/visibility - Change visibility (owner or superuser)
-async fn update_image_visibility(
+// DEPRECATED: Use unified PATCH /gallery/{id} instead
+// This handler is kept temporarily for backwards compatibility but will be removed
+
+// PATCH /api/gallery/{id} - Unified partial update (title, visibility, pinned)
+async fn update_gallery(
     Extension(auth_user): Extension<AuthUser>,
     State(state): State<Arc<AppState>>,
     Path(id): Path<i32>,
-    Json(payload): Json<UpdateVisibilityRequest>,
+    Json(payload): Json<UpdateGalleryRequest>,
 ) -> (StatusCode, Json<ApiResponse<GalleryItem>>) {
-    let val = payload.visibility.trim().to_lowercase();
-    if val != "public" && val != "private" {
+    const MAX_PINNED_IMAGES: i64 = 8;
+
+    // Check if at least one field is provided
+    if payload.title.is_none() && payload.visibility.is_none() && payload.pinned.is_none() {
         return (
             StatusCode::BAD_REQUEST,
-            Json(ApiResponse::error("Visibility must be 'public' or 'private'")),
+            Json(ApiResponse::error("No fields to update")),
         );
     }
 
+    // Fetch current item
     let item: Result<GalleryItem, _> = sqlx::query_as(
         "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, preview_path, pinned, status, pin_order FROM gallery WHERE id = ?",
     )
@@ -741,39 +782,140 @@ async fn update_image_visibility(
     .fetch_one(&state.db.pool)
     .await;
 
-    match item {
-        Ok(mut item) => {
-            if item.user_id != auth_user.id && !auth_user.is_superuser() {
+    let mut item = match item {
+        Ok(item) => item,
+        Err(_) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ApiResponse::error("Image not found")),
+            );
+        }
+    };
+
+    // Check ownership
+    if item.user_id != auth_user.id && !auth_user.is_superuser() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(ApiResponse::error("You can only edit your own images")),
+        );
+    }
+
+    // Validate and apply title
+    let new_title = if let Some(ref title) = payload.title {
+        if title.trim().is_empty() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiResponse::error("Title cannot be empty")),
+            );
+        }
+        title.clone()
+    } else {
+        item.title.clone()
+    };
+
+    // Validate and apply visibility
+    let new_visibility = if let Some(ref visibility) = payload.visibility {
+        let val = visibility.trim().to_lowercase();
+        if val != "public" && val != "private" {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiResponse::error("Visibility must be 'public' or 'private'")),
+            );
+        }
+        val
+    } else {
+        item.visibility.clone()
+    };
+
+    // Handle pinned logic (more complex due to pin_order bookkeeping)
+    let (new_pinned, new_pin_order) = if let Some(pinned_value) = payload.pinned {
+        if pinned_value && !item.pinned {
+            // Pinning: check limit and assign pin_order
+            let count_result: Result<(i64,), _> = sqlx::query_as(
+                "SELECT COUNT(*) FROM gallery WHERE user_id = ? AND pinned = TRUE"
+            )
+            .bind(auth_user.id)
+            .fetch_one(&state.db.pool)
+            .await;
+
+            let count = match count_result {
+                Ok((count,)) => count,
+                Err(e) => {
+                    tracing::error!("Failed to count pinned images: {:?}", e);
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ApiResponse::error("Failed to check pinned count")),
+                    );
+                }
+            };
+
+            if count >= MAX_PINNED_IMAGES {
                 return (
-                    StatusCode::FORBIDDEN,
-                    Json(ApiResponse::error("You can only edit your own images")),
+                    StatusCode::BAD_REQUEST,
+                    Json(ApiResponse::error(&format!("You can only pin up to {} images. Please unpin another image first.", MAX_PINNED_IMAGES))),
                 );
             }
 
-            let result = sqlx::query("UPDATE gallery SET visibility = ? WHERE id = ?")
-                .bind(&val)
-                .bind(id)
-                .execute(&state.db.pool)
-                .await;
+            // Get max pin_order and assign next value
+            let max_order_result: Result<Option<(Option<i32>,)>, _> = sqlx::query_as(
+                "SELECT MAX(pin_order) FROM gallery WHERE user_id = ? AND pinned = TRUE"
+            )
+            .bind(auth_user.id)
+            .fetch_optional(&state.db.pool)
+            .await;
 
-            match result {
-                Ok(_) => {
-                    item.visibility = val;
-                    (StatusCode::OK, Json(ApiResponse::success(item)))
-                }
+            let new_pin_order = match max_order_result {
+                Ok(Some((Some(max_order),))) => max_order + 1,
+                Ok(Some((None,))) | Ok(None) => 1,
                 Err(e) => {
-                    tracing::error!("Failed to update image visibility: {:?}", e);
-                    (
+                    tracing::error!("Failed to get max pin_order: {:?}", e);
+                    return (
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(ApiResponse::error("Failed to update image visibility")),
-                    )
+                        Json(ApiResponse::error("Failed to assign pin order")),
+                    );
                 }
-            }
+            };
+
+            (true, new_pin_order)
+        } else if !pinned_value && item.pinned {
+            // Unpinning: reset pin_order to 0
+            (false, 0)
+        } else {
+            // No change needed in pin status
+            (item.pinned, item.pin_order)
         }
-        Err(_) => (
-            StatusCode::NOT_FOUND,
-            Json(ApiResponse::error("Image not found")),
-        ),
+    } else {
+        // pinned field not provided, keep current values
+        (item.pinned, item.pin_order)
+    };
+
+    // Update database (all fields in one query)
+    let result = sqlx::query(
+        "UPDATE gallery SET title = ?, visibility = ?, pinned = ?, pin_order = ? WHERE id = ?"
+    )
+    .bind(&new_title)
+    .bind(&new_visibility)
+    .bind(new_pinned)
+    .bind(new_pin_order)
+    .bind(id)
+    .execute(&state.db.pool)
+    .await;
+
+    match result {
+        Ok(_) => {
+            item.title = new_title;
+            item.visibility = new_visibility;
+            item.pinned = new_pinned;
+            item.pin_order = new_pin_order;
+            (StatusCode::OK, Json(ApiResponse::success(item)))
+        }
+        Err(e) => {
+            tracing::error!("Failed to update gallery item: {:?}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::error("Failed to update gallery item")),
+            )
+        }
     }
 }
 
@@ -1286,132 +1428,10 @@ async fn check_status(
 }
 
 // PATCH /gallery/{id}/pinned - Update pinned status (owner or superuser)
-async fn update_image_pinned(
-    Extension(auth_user): Extension<AuthUser>,
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<i32>,
-    Json(payload): Json<UpdatePinnedRequest>,
-) -> (StatusCode, Json<ApiResponse<GalleryItem>>) {
-    const MAX_PINNED_IMAGES: i64 = 8;
-    
-    let item: Result<GalleryItem, _> = sqlx::query_as(
-        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, preview_path, pinned, status, pin_order FROM gallery WHERE id = ?",
-    )
-    .bind(id)
-    .fetch_one(&state.db.pool)
-    .await;
+// DEPRECATED: Use unified PATCH /gallery/{id} instead
+// This handler has been replaced by update_gallery
 
-    match item {
-        Ok(mut item) => {
-            if item.user_id != auth_user.id && !auth_user.is_superuser() {
-                return (
-                    StatusCode::FORBIDDEN,
-                    Json(ApiResponse::error("You can only edit your own images")),
-                );
-            }
-
-            // If pinning, check the limit and assign pin_order
-            if payload.pinned && !item.pinned {
-                // Count existing pinned images
-                let count_result: Result<(i64,), _> = sqlx::query_as(
-                    "SELECT COUNT(*) FROM gallery WHERE user_id = ? AND pinned = TRUE"
-                )
-                .bind(auth_user.id)
-                .fetch_one(&state.db.pool)
-                .await;
-
-                match count_result {
-                    Ok((count,)) => {
-                        if count >= MAX_PINNED_IMAGES {
-                            return (
-                                StatusCode::BAD_REQUEST,
-                                Json(ApiResponse::error(&format!("You can only pin up to {} images. Please unpin another image first.", MAX_PINNED_IMAGES))),
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!("Failed to count pinned images: {:?}", e);
-                        return (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            Json(ApiResponse::error("Failed to check pinned count")),
-                        );
-                    }
-                }
-
-                // Get max pin_order and assign next value
-                let max_order_result: Result<Option<(Option<i32>,)>, _> = sqlx::query_as(
-                    "SELECT MAX(pin_order) FROM gallery WHERE user_id = ? AND pinned = TRUE"
-                )
-                .bind(auth_user.id)
-                .fetch_optional(&state.db.pool)
-                .await;
-
-                let new_pin_order = match max_order_result {
-                    Ok(Some((Some(max_order),))) => max_order + 1,
-                    Ok(Some((None,))) | Ok(None) => 1,
-                    Err(e) => {
-                        tracing::error!("Failed to get max pin_order: {:?}", e);
-                        return (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            Json(ApiResponse::error("Failed to assign pin order")),
-                        );
-                    }
-                };
-
-                let result = sqlx::query("UPDATE gallery SET pinned = TRUE, pin_order = ? WHERE id = ?")
-                    .bind(new_pin_order)
-                    .bind(id)
-                    .execute(&state.db.pool)
-                    .await;
-
-                match result {
-                    Ok(_) => {
-                        item.pinned = true;
-                        item.pin_order = new_pin_order;
-                        (StatusCode::OK, Json(ApiResponse::success(item)))
-                    }
-                    Err(e) => {
-                        tracing::error!("Failed to update image pinned status: {:?}", e);
-                        (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            Json(ApiResponse::error("Failed to update pinned status")),
-                        )
-                    }
-                }
-            } else if !payload.pinned && item.pinned {
-                // Unpinning: reset pin_order to 0
-                let result = sqlx::query("UPDATE gallery SET pinned = FALSE, pin_order = 0 WHERE id = ?")
-                    .bind(id)
-                    .execute(&state.db.pool)
-                    .await;
-
-                match result {
-                    Ok(_) => {
-                        item.pinned = false;
-                        item.pin_order = 0;
-                        (StatusCode::OK, Json(ApiResponse::success(item)))
-                    }
-                    Err(e) => {
-                        tracing::error!("Failed to update image pinned status: {:?}", e);
-                        (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            Json(ApiResponse::error("Failed to update pinned status")),
-                        )
-                    }
-                }
-            } else {
-                // No change needed
-                (StatusCode::OK, Json(ApiResponse::success(item)))
-            }
-        }
-        Err(_) => (
-            StatusCode::NOT_FOUND,
-            Json(ApiResponse::error("Image not found")),
-        ),
-    }
-}
-
-// POST /gallery/{id}/reprocess - Retry thumbnail generation for a failed image
+// POST /gallery/{id}/reprocess - Retry thumbnail generation for a failed image (async, returns 202)
 async fn reprocess_image(
     Extension(auth_user): Extension<AuthUser>,
     State(state): State<Arc<AppState>>,
@@ -1427,7 +1447,7 @@ async fn reprocess_image(
     .fetch_one(&state.db.pool)
     .await;
 
-    let mut item = match item {
+    let item = match item {
         Ok(item) => item,
         Err(_) => {
             return (
@@ -1445,142 +1465,155 @@ async fn reprocess_image(
         );
     }
 
-    // Read the raw file from disk
-    let file_data = match read_file(&state.config.storage_dir, &item.stored_path).await {
-        Ok(data) => data,
-        Err(e) => {
-            tracing::error!("Raw file not found for reprocessing: {}", e);
-            return (
-                StatusCode::NOT_FOUND,
-                Json(ApiResponse::error("Raw file not found on disk. Cannot reprocess.")),
-            );
-        }
-    };
+    // Verify raw file exists on disk (before queuing)
+    if let Err(e) = read_file(&state.config.storage_dir, &item.stored_path).await {
+        tracing::error!("Raw file not found for reprocessing: {}", e);
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::error("Raw file not found on disk. Cannot reprocess.")),
+        );
+    }
 
-    // Set status to processing
-    let _ = sqlx::query("UPDATE gallery SET status = 'processing' WHERE id = ?")
+    // Set status to processing (before spawning background task)
+    let update_result = sqlx::query("UPDATE gallery SET status = 'processing' WHERE id = ?")
         .bind(id)
         .execute(&state.db.pool)
         .await;
 
-    let image_id = Uuid::new_v4();
-    let filename = item.original_filename.clone();
-    let stored_path = item.stored_path.clone();
-    
-    tracing::info!(%image_id, %filename, "Starting thumbnail and preview reprocessing");
-
-    // Acquire semaphore permit and generate thumbnail + preview
-    let semaphore = state.image_semaphore.clone();
-    let _permit = match semaphore.acquire_owned().await {
-        Ok(permit) => permit,
-        Err(_) => {
-            let _ = sqlx::query("UPDATE gallery SET status = 'failed_processing' WHERE id = ?")
-                .bind(id)
-                .execute(&state.db.pool)
-                .await;
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiResponse::error("Failed to acquire processing slot")),
-            );
-        }
-    };
-
-    // Generate thumbnail and preview (CPU-bound, use blocking pool)
-    // Uses optimized single decode + cascading resize
-    let process_result = tokio::task::spawn_blocking(move || {
-        generate_thumbnail_and_preview(&file_data)
-    })
-    .await;
-
-    match process_result {
-        Ok(Ok((thumbnail_data, preview_data))) => {
-            // Save both thumbnail and preview to disk in parallel
-            let thumbnail_path = generate_thumbnail_path(&stored_path);
-            let preview_path = generate_preview_path(&stored_path);
-            let thumbnail_full_path = std::path::PathBuf::from(&state.config.storage_dir).join(&thumbnail_path);
-            let preview_full_path = std::path::PathBuf::from(&state.config.storage_dir).join(&preview_path);
-            
-            let thumb_save = save_file(&thumbnail_full_path, &thumbnail_data);
-            let preview_save = save_file(&preview_full_path, &preview_data);
-            
-            let (thumb_result, preview_result) = tokio::join!(thumb_save, preview_save);
-            
-            let mut save_errors = Vec::new();
-            let mut final_thumb_path = None;
-            let mut final_preview_path = None;
-            
-            match thumb_result {
-                Ok(_) => final_thumb_path = Some(thumbnail_path),
-                Err(e) => save_errors.push(format!("thumbnail: {}", e)),
-            }
-            
-            match preview_result {
-                Ok(_) => final_preview_path = Some(preview_path),
-                Err(e) => save_errors.push(format!("preview: {}", e)),
-            }
-            
-            if !save_errors.is_empty() {
-                tracing::error!(%image_id, "Failed to save files: {}", save_errors.join(", "));
-                let _ = sqlx::query("UPDATE gallery SET status = 'failed_processing' WHERE id = ?")
-                    .bind(id)
-                    .execute(&state.db.pool)
-                    .await;
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ApiResponse::error(&format!("Failed to save files: {}", save_errors.join(", ")))),
-                );
-            }
-
-            // Update status to active and set thumbnail_path + preview_path
-            let result = sqlx::query(
-                "UPDATE gallery SET status = 'active', thumbnail_path = ?, preview_path = ? WHERE id = ?"
-            )
-            .bind(&final_thumb_path)
-            .bind(&final_preview_path)
-            .bind(id)
-            .execute(&state.db.pool)
-            .await;
-
-            match result {
-                Ok(_) => {
-                    item.status = "active".to_string();
-                    item.thumbnail_path = final_thumb_path;
-                    item.preview_path = final_preview_path;
-                    tracing::info!(%image_id, "Thumbnail and preview reprocessing successful");
-                    (StatusCode::OK, Json(ApiResponse::success(item)))
-                }
-                Err(e) => {
-                    tracing::error!("Failed to update database after reprocessing: {}", e);
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(ApiResponse::error("Failed to update database")),
-                    )
-                }
-            }
-        }
-        Ok(Err(e)) => {
-            tracing::error!(%image_id, "Image processing failed: {}", e);
-            let _ = sqlx::query("UPDATE gallery SET status = 'failed_processing' WHERE id = ?")
-                .bind(id)
-                .execute(&state.db.pool)
-                .await;
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiResponse::error(&format!("Failed to generate thumbnail and preview: {}", e))),
-            )
-        }
-        Err(e) => {
-            tracing::error!(%image_id, "Thumbnail task panicked: {}", e);
-            let _ = sqlx::query("UPDATE gallery SET status = 'failed_processing' WHERE id = ?")
-                .bind(id)
-                .execute(&state.db.pool)
-                .await;
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiResponse::error("Thumbnail generation task panicked")),
-            )
-        }
+    if let Err(e) = update_result {
+        tracing::error!("Failed to update status to processing: {}", e);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse::error("Failed to start reprocessing")),
+        );
     }
+
+    let batch_id = Uuid::new_v4();
+    tracing::info!(%batch_id, item_id = id, "Queued reprocessing (returning 202 Accepted)");
+
+    // Spawn detached background task (same pattern as upload)
+    let db_pool = state.db.pool.clone();
+    let storage_dir = state.config.storage_dir.clone();
+    let semaphore = state.image_semaphore.clone();
+    let item_id = item.id;
+    let stored_path = item.stored_path.clone();
+    let filename = item.original_filename.clone();
+
+    tokio::spawn(async move {
+        let image_id = Uuid::new_v4();
+        tracing::info!(%batch_id, %image_id, %filename, "Background reprocessing started");
+
+        // Read raw file
+        let file_data = match read_file(&storage_dir, &stored_path).await {
+            Ok(data) => data,
+            Err(e) => {
+                tracing::error!(%batch_id, "Failed to read raw file in background: {}", e);
+                let _ = sqlx::query("UPDATE gallery SET status = 'failed_processing' WHERE id = ?")
+                    .bind(item_id)
+                    .execute(&db_pool)
+                    .await;
+                return;
+            }
+        };
+
+        // Acquire semaphore permit (memory ceiling)
+        let _permit = match semaphore.acquire_owned().await {
+            Ok(permit) => permit,
+            Err(_) => {
+                tracing::error!(%batch_id, "Failed to acquire processing slot");
+                let _ = sqlx::query("UPDATE gallery SET status = 'failed_processing' WHERE id = ?")
+                    .bind(item_id)
+                    .execute(&db_pool)
+                    .await;
+                return;
+            }
+        };
+
+        // Generate thumbnail and preview (CPU-bound, use blocking pool)
+        let process_result = tokio::task::spawn_blocking(move || {
+            generate_thumbnail_and_preview(&file_data)
+        })
+        .await;
+
+        match process_result {
+            Ok(Ok((thumbnail_data, preview_data))) => {
+                // Save both thumbnail and preview to disk in parallel
+                let thumbnail_path = generate_thumbnail_path(&stored_path);
+                let preview_path = generate_preview_path(&stored_path);
+                let thumbnail_full_path = std::path::PathBuf::from(&storage_dir).join(&thumbnail_path);
+                let preview_full_path = std::path::PathBuf::from(&storage_dir).join(&preview_path);
+                
+                let thumb_save = save_file(&thumbnail_full_path, &thumbnail_data);
+                let preview_save = save_file(&preview_full_path, &preview_data);
+                
+                let (thumb_result, preview_result) = tokio::join!(thumb_save, preview_save);
+                
+                let mut final_thumb_path = None;
+                let mut final_preview_path = None;
+                
+                if thumb_result.is_ok() {
+                    final_thumb_path = Some(thumbnail_path);
+                }
+                
+                if preview_result.is_ok() {
+                    final_preview_path = Some(preview_path);
+                }
+                
+                if final_thumb_path.is_some() || final_preview_path.is_some() {
+                    // Update status to active and set paths
+                    let result = sqlx::query(
+                        "UPDATE gallery SET status = 'active', thumbnail_path = ?, preview_path = ? WHERE id = ?"
+                    )
+                    .bind(&final_thumb_path)
+                    .bind(&final_preview_path)
+                    .bind(item_id)
+                    .execute(&db_pool)
+                    .await;
+
+                    match result {
+                        Ok(_) => {
+                            tracing::info!(%batch_id, %image_id, "Reprocessing successful");
+                        }
+                        Err(e) => {
+                            tracing::error!(%batch_id, "Failed to update database after reprocessing: {}", e);
+                            let _ = sqlx::query("UPDATE gallery SET status = 'failed_processing' WHERE id = ?")
+                                .bind(item_id)
+                                .execute(&db_pool)
+                                .await;
+                        }
+                    }
+                } else {
+                    tracing::error!(%batch_id, "Failed to save both thumbnail and preview");
+                    let _ = sqlx::query("UPDATE gallery SET status = 'failed_processing' WHERE id = ?")
+                        .bind(item_id)
+                        .execute(&db_pool)
+                        .await;
+                }
+            }
+            Ok(Err(e)) => {
+                tracing::error!(%batch_id, %image_id, "Image processing failed: {}", e);
+                let _ = sqlx::query("UPDATE gallery SET status = 'failed_processing' WHERE id = ?")
+                    .bind(item_id)
+                    .execute(&db_pool)
+                    .await;
+            }
+            Err(e) => {
+                tracing::error!(%batch_id, %image_id, "Task panicked: {}", e);
+                let _ = sqlx::query("UPDATE gallery SET status = 'failed_processing' WHERE id = ?")
+                    .bind(item_id)
+                    .execute(&db_pool)
+                    .await;
+            }
+        }
+
+        tracing::info!(%batch_id, "Background reprocessing completed");
+    }.instrument(tracing::info_span!("bg_reprocess", %batch_id, item_id)));
+
+    // Return 202 Accepted immediately with item in processing status
+    let mut response_item = item;
+    response_item.status = "processing".to_string();
+    
+    (StatusCode::ACCEPTED, Json(ApiResponse::success(response_item)))
 }
 
 
