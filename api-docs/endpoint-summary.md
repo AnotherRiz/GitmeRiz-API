@@ -24,7 +24,6 @@
 | GET | `/gallery/r/{short_id}` | Optional | Serve raw full-size image inline (public: no auth, private: signed URL/cookie/header) |
 | GET | `/gallery/t/{short_id}` | Optional | Serve pre-generated thumbnail inline (WebP lossy, cached 1 year) |
 | GET | `/gallery/p/{short_id}` | Optional | Serve pre-generated medium preview inline (WebP lossy, cached 1 hour) |
-| POST | `/gallery/{short_id}/sign` | Yes | Generate signed URL for private image (15 min expiry, owner/superuser only) |
 | PATCH | `/gallery/{id}` | Yes | Unified partial update: title/visibility/pinned (optional fields, owner/superuser) |
 | PATCH | `/gallery/reorder-pins` | Yes | Persist custom order for pinned images (drag-and-drop support) (owner / superuser) |
 | POST | `/gallery/{id}/reprocess` | Yes | Retry thumbnail + preview generation - returns `202`, processes in background, poll `/gallery/status` (owner / superuser) |

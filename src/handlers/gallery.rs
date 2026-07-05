@@ -7,7 +7,6 @@ use axum::{
     routing::{get, patch, post},
     Extension, Json, Router,
 };
-use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use tower_cookies::Cookies;
@@ -80,61 +79,7 @@ struct ReorderPinsRequest {
     ordered_ids: Vec<i32>,
 }
 
-// Query parameters for image access with signed URL
-#[derive(Debug, Deserialize)]
-struct ImageQuery {
-    /// Expiration timestamp (Unix timestamp)
-    expires: Option<i64>,
-    /// HMAC signature: SHA256(short_id + user_id + expires + secret)
-    sig: Option<String>,
-}
 
-// Response for signed URL generation
-#[derive(Debug, Serialize)]
-struct SignedUrlResponse {
-    url: String,
-    expires_at: i64,
-}
-
-/// Generate HMAC-SHA256 signature for signed URL
-fn generate_signature(short_id: &str, user_id: i32, expires: i64, secret: &str) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    
-    // Create a simple hash (in production, use proper HMAC-SHA256)
-    let data = format!("{}:{}:{}:{}", short_id, user_id, expires, secret);
-    let mut hasher = DefaultHasher::new();
-    data.hash(&mut hasher);
-    let hash = hasher.finish();
-    
-    // Convert to hex string (16 chars)
-    format!("{:016x}", hash)
-}
-
-/// Validate signed URL parameters
-fn validate_signed_url(
-    query: &ImageQuery,
-    short_id: &str,
-    owner_user_id: i32,
-    secret: &str,
-) -> Result<(), &'static str> {
-    let expires = query.expires.ok_or("Missing 'expires' parameter")?;
-    let sig = query.sig.as_ref().ok_or("Missing 'sig' parameter")?;
-    
-    // Check if URL has expired
-    let now = Utc::now().timestamp();
-    if now > expires {
-        return Err("URL has expired");
-    }
-    
-    // Validate signature
-    let expected_sig = generate_signature(short_id, owner_user_id, expires, secret);
-    if sig != &expected_sig {
-        return Err("Invalid signature");
-    }
-    
-    Ok(())
-}
 
 pub fn public_routes() -> Router<Arc<AppState>> {
     Router::new()
@@ -155,11 +100,9 @@ pub fn protected_routes() -> Router<Arc<AppState>> {
         .route("/gallery/reorder-pins", patch(reorder_pins))
         .route("/gallery/{id}", patch(update_gallery).delete(delete_image))
         .route("/gallery/{id}/reprocess", post(reprocess_image))
-        .route("/gallery/{short_id}/sign", post(generate_signed_url))
 }
 
 // Helper function to extract optional authentication from cookie or header
-// (Query parameter now uses signed URLs instead of JWT token)
 fn extract_optional_auth(
     cookies: &Cookies,
     headers: &HeaderMap,
@@ -990,7 +933,6 @@ async fn delete_image(
 async fn serve_raw_image(
     State(state): State<Arc<AppState>>,
     Path(short_id): Path<String>,
-    Query(query): Query<ImageQuery>,
     cookies: Cookies,
     headers: HeaderMap,
 ) -> impl IntoResponse {
@@ -1005,50 +947,31 @@ async fn serve_raw_image(
         Ok(item) => {
             // Access control based on visibility:
             // - Public images: accessible to everyone
-            // - Private images: require authentication OR valid signed URL
+            // - Private images: require cookie or Bearer token authentication
             if item.visibility == "private" {
-                // Method 1: Try signed URL (for <img> tags)
-                if query.expires.is_some() && query.sig.is_some() {
-                    match validate_signed_url(&query, &short_id, item.user_id, &state.config.jwt_secret) {
-                        Ok(()) => {
-                            tracing::debug!("Access granted via signed URL");
-                            // Signed URL valid, continue to serve
-                        }
-                        Err(e) => {
-                            tracing::warn!("Signed URL validation failed: {}", e);
+                // Require cookie/header authentication
+                let auth_user = extract_optional_auth(&cookies, &headers, &state.config.jwt_secret);
+                
+                match auth_user {
+                    Some(user) => {
+                        // Check if user is owner or superuser
+                        if item.user_id != user.id && !user.is_superuser() {
                             return build_error_response(
-                                StatusCode::UNAUTHORIZED,
-                                e,
+                                StatusCode::FORBIDDEN,
+                                "You can only access your own private images",
                                 &headers,
                                 &state.config.frontend_url,
                             );
                         }
+                        // Access granted, continue to serve file
                     }
-                } else {
-                    // Method 2: Try cookie/header authentication
-                    let auth_user = extract_optional_auth(&cookies, &headers, &state.config.jwt_secret);
-                    
-                    match auth_user {
-                        Some(user) => {
-                            // Check if user is owner or superuser
-                            if item.user_id != user.id && !user.is_superuser() {
-                                return build_error_response(
-                                    StatusCode::FORBIDDEN,
-                                    "You can only access your own private images",
-                                    &headers,
-                                    &state.config.frontend_url,
-                                );
-                            }
-                            // Access granted, continue to serve file
-                        }
-                        None => {
-                            return build_error_response(
-                                StatusCode::UNAUTHORIZED,
-                                "This image is private. Authentication required.",
-                                &headers,
-                                &state.config.frontend_url,
-                            );
-                        }
+                    None => {
+                        return build_error_response(
+                            StatusCode::UNAUTHORIZED,
+                            "This image is private. Authentication required.",
+                            &headers,
+                            &state.config.frontend_url,
+                        );
                     }
                 }
             }
@@ -1087,7 +1010,6 @@ async fn serve_raw_image(
 async fn serve_thumbnail_image(
     State(state): State<Arc<AppState>>,
     Path(short_id): Path<String>,
-    Query(query): Query<ImageQuery>,
     cookies: Cookies,
     headers: HeaderMap,
 ) -> impl IntoResponse {
@@ -1102,50 +1024,31 @@ async fn serve_thumbnail_image(
         Ok(item) => {
             // Access control based on visibility:
             // - Public images: accessible to everyone
-            // - Private images: require authentication OR valid signed URL
+            // - Private images: require cookie or Bearer token authentication
             if item.visibility == "private" {
-                // Method 1: Try signed URL (for <img> tags)
-                if query.expires.is_some() && query.sig.is_some() {
-                    match validate_signed_url(&query, &short_id, item.user_id, &state.config.jwt_secret) {
-                        Ok(()) => {
-                            tracing::debug!("Access granted via signed URL");
-                            // Signed URL valid, continue to serve
-                        }
-                        Err(e) => {
-                            tracing::warn!("Signed URL validation failed: {}", e);
+                // Require cookie/header authentication
+                let auth_user = extract_optional_auth(&cookies, &headers, &state.config.jwt_secret);
+                
+                match auth_user {
+                    Some(user) => {
+                        // Check if user is owner or superuser
+                        if item.user_id != user.id && !user.is_superuser() {
                             return build_error_response(
-                                StatusCode::UNAUTHORIZED,
-                                e,
+                                StatusCode::FORBIDDEN,
+                                "You can only access your own private images",
                                 &headers,
                                 &state.config.frontend_url,
                             );
                         }
+                        // Access granted, continue to serve thumbnail
                     }
-                } else {
-                    // Method 2: Try cookie/header authentication
-                    let auth_user = extract_optional_auth(&cookies, &headers, &state.config.jwt_secret);
-                    
-                    match auth_user {
-                        Some(user) => {
-                            // Check if user is owner or superuser
-                            if item.user_id != user.id && !user.is_superuser() {
-                                return build_error_response(
-                                    StatusCode::FORBIDDEN,
-                                    "You can only access your own private images",
-                                    &headers,
-                                    &state.config.frontend_url,
-                                );
-                            }
-                            // Access granted, continue to serve thumbnail
-                        }
-                        None => {
-                            return build_error_response(
-                                StatusCode::UNAUTHORIZED,
-                                "This image is private. Authentication required.",
-                                &headers,
-                                &state.config.frontend_url,
-                            );
-                        }
+                    None => {
+                        return build_error_response(
+                            StatusCode::UNAUTHORIZED,
+                            "This image is private. Authentication required.",
+                            &headers,
+                            &state.config.frontend_url,
+                        );
                     }
                 }
             }
@@ -1194,61 +1097,10 @@ async fn serve_thumbnail_image(
     }
 }
 
-// POST /api/gallery/{short_id}/sign - Generate signed URL for private image (authenticated)
-async fn generate_signed_url(
-    Extension(auth_user): Extension<AuthUser>,
-    State(state): State<Arc<AppState>>,
-    Path(short_id): Path<String>,
-) -> (StatusCode, Json<ApiResponse<SignedUrlResponse>>) {
-    // Fetch the image
-    let item: Result<GalleryItem, _> = sqlx::query_as(
-        "SELECT id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, preview_path, pinned, status, pin_order FROM gallery WHERE short_id = ?",
-    )
-    .bind(&short_id)
-    .fetch_one(&state.db.pool)
-    .await;
-
-    match item {
-        Ok(item) => {
-            // Check ownership (owner or superuser can generate signed URLs)
-            if item.user_id != auth_user.id && !auth_user.is_superuser() {
-                return (
-                    StatusCode::FORBIDDEN,
-                    Json(ApiResponse::error("You can only generate signed URLs for your own images")),
-                );
-            }
-
-            // Generate expiration timestamp (15 minutes from now)
-            let expires = Utc::now().timestamp() + 15 * 60;
-
-            // Generate signature
-            let sig = generate_signature(&short_id, item.user_id, expires, &state.config.jwt_secret);
-
-            // Build signed URL (no /api prefix since routes are at root level)
-            let base_url = format!("http://{}:{}/gallery", state.config.server_host, state.config.server_port);
-            let raw_url = format!("{}/r/{}?expires={}&sig={}", base_url, short_id, expires, sig);
-
-            (
-                StatusCode::OK,
-                Json(ApiResponse::success(SignedUrlResponse {
-                    url: raw_url,
-                    expires_at: expires,
-                })),
-            )
-        }
-        Err(_) => (
-            StatusCode::NOT_FOUND,
-            Json(ApiResponse::error("Image not found")),
-        ),
-    }
-}
-
-
 // GET /gallery/p/{short_id} - Serve preview image (pre-generated, medium size)
 async fn serve_preview_image(
     State(state): State<Arc<AppState>>,
     Path(short_id): Path<String>,
-    Query(query): Query<ImageQuery>,
     cookies: Cookies,
     headers: HeaderMap,
 ) -> impl IntoResponse {
@@ -1261,41 +1113,33 @@ async fn serve_preview_image(
 
     match item {
         Ok(item) => {
-            // Access control (same as raw and thumbnail)
+            // Access control based on visibility:
+            // - Public images: accessible to everyone
+            // - Private images: require cookie or Bearer token authentication
             if item.visibility == "private" {
-                if query.expires.is_some() && query.sig.is_some() {
-                    match validate_signed_url(&query, &short_id, item.user_id, &state.config.jwt_secret) {
-                        Ok(()) => {},
-                        Err(e) => {
+                // Require cookie/header authentication
+                let auth_user = extract_optional_auth(&cookies, &headers, &state.config.jwt_secret);
+                
+                match auth_user {
+                    Some(user) => {
+                        // Check if user is owner or superuser
+                        if item.user_id != user.id && !user.is_superuser() {
                             return build_error_response(
-                                StatusCode::UNAUTHORIZED,
-                                e,
+                                StatusCode::FORBIDDEN,
+                                "You can only access your own private images",
                                 &headers,
                                 &state.config.frontend_url,
                             );
                         }
+                        // Access granted, continue to serve preview
                     }
-                } else {
-                    let auth_user = extract_optional_auth(&cookies, &headers, &state.config.jwt_secret);
-                    match auth_user {
-                        Some(user) => {
-                            if item.user_id != user.id && !user.is_superuser() {
-                                return build_error_response(
-                                    StatusCode::FORBIDDEN,
-                                    "You can only access your own private images",
-                                    &headers,
-                                    &state.config.frontend_url,
-                                );
-                            }
-                        }
-                        None => {
-                            return build_error_response(
-                                StatusCode::UNAUTHORIZED,
-                                "This image is private. Authentication required.",
-                                &headers,
-                                &state.config.frontend_url,
-                            );
-                        }
+                    None => {
+                        return build_error_response(
+                            StatusCode::UNAUTHORIZED,
+                            "This image is private. Authentication required.",
+                            &headers,
+                            &state.config.frontend_url,
+                        );
                     }
                 }
             }
