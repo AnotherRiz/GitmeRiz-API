@@ -320,10 +320,7 @@ browser tab or `<img>` tag. This is the endpoint for shareable image URLs.
 
 **Access rules:**
 - **Public images**: accessible to anyone via the unguessable `short_id` — no auth required.
-- **Private images**: require one of the following (checked in this order):
-  1. **Signed URL**: query params `?expires={unix_ts}&sig={signature}` (see `POST /gallery/{short_id}/sign`).
-  2. **Cookie**: the `auth_token` cookie.
-  3. **Header**: `Authorization: Bearer <token>`.
+- **Private images**: require authentication via **cookie** (`auth_token`) or **header** (`Authorization: Bearer <token>`).
   The authenticated user must be the owner or a `superuser`.
 
 **Error responses use content negotiation** (based on the `Accept` header):
@@ -332,16 +329,13 @@ browser tab or `<img>` tag. This is the endpoint for shareable image URLs.
 - Status codes are the same for both: `401`, `403`, `404`.
 
 Errors:
-- `401` — image is private and no valid auth/signed URL was provided (or the signed URL expired/invalid).
+- `401` — image is private and no valid authentication was provided.
 - `403` — authenticated but not the owner or a superuser.
 - `404` — image not found, or file missing on disk.
 
 ```bash
 # Public image in an <img> tag (no auth)
 <img src="http://localhost:3000/gallery/r/aB3xYz9Q" alt="Sunset" />
-
-# Private image with a signed URL
-<img src="http://localhost:3000/gallery/r/xYz9QaB3?expires=1719936000&sig=a1b2c3d4e5f67890" alt="Private" />
 
 # Private image via fetch (cookie sent automatically)
 fetch('http://localhost:3000/gallery/r/xYz9QaB3', { credentials: 'include' })
@@ -380,36 +374,6 @@ Errors:
 
 ```bash
 <img src="http://localhost:3000/gallery/p/aB3xYz9Q" alt="Preview" />
-```
-
-## POST /gallery/{short_id}/sign
-
-Generates a **signed URL** for a private image, so it can be embedded in an `<img>` tag
-without exposing a JWT. **Requires authentication.** Owner or superuser only.
-
-- The signature is derived from `short_id`, `user_id`, `expires`, and the server secret.
-- Signed URLs are valid for **15 minutes**.
-- The returned signature also works for the `/t/{short_id}` (thumbnail) and `/p/{short_id}` (preview)
-  endpoints — reuse the same `expires` and `sig` query params.
-
-Response `200`:
-```json
-{
-  "success": true,
-  "data": {
-    "url": "http://localhost:3000/gallery/r/xYz9QaB3?expires=1719936000&sig=a1b2c3d4e5f67890",
-    "expires_at": 1719936000
-  }
-}
-```
-
-Errors:
-- `403` — not the owner and not a superuser.
-- `404` — image not found.
-
-```bash
-curl -X POST http://localhost:3000/gallery/xYz9QaB3/sign \
-  -H "Authorization: Bearer <token>"
 ```
 
 ## PATCH /gallery/{id}
