@@ -5,13 +5,14 @@
 | Method | Endpoint | Auth | Notes |
 |--------|----------|------|-------|
 | GET | `/health` | No | Health check |
-| POST | `/register` | No | Register (role `user`) |
+| POST | `/register` | No | Register (role `user`), validates username/name/email/password |
 | POST | `/login` | No | Login, sets `auth_token` cookie + returns JWT |
 | POST | `/logout` | No | Clears the `auth_token` cookie |
 | GET | `/users/me` | Yes | Current user |
-| GET | `/users` | Yes | List users (superuser) |
+| GET | `/users` | Yes | List users with pagination (superuser) - supports `?page=1&limit=20` |
 | GET | `/users/{id}` | Yes | Get user (self or superuser) |
-| PUT | `/users/{id}` | Yes | Update user (self or superuser) |
+| PATCH | `/users/{id}` | Yes | Partial profile update: name/username/email (self or superuser) - validates input, no password/role |
+| PATCH | `/users/me/password` | Yes | Change password - requires current password verification |
 | DELETE | `/users/{id}` | Yes | Delete user (superuser) |
 | GET | `/gallery/public` | No | List all public images |
 | GET | `/gallery/me` | Yes | List current user's images (public & private) |

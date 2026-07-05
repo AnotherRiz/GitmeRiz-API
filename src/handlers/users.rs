@@ -1,7 +1,7 @@
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
-    routing::{get, post},
+    routing::{get, patch, post},
     Extension, Json, Router,
 };
 use std::sync::Arc;
@@ -9,8 +9,11 @@ use tower_cookies::{Cookie, Cookies};
 
 use crate::auth::{create_token, hash_password, verify_password};
 use crate::models::{
-    ApiResponse, AuthUser, LoginRequest, LoginResponse, RegisterRequest, User, UserResponse,
+    ApiResponse, AuthUser, ChangePasswordRequest, LoginRequest, LoginResponse, 
+    PaginatedUsersResponse, PaginationQuery, RegisterRequest, UpdateUserRequest, 
+    User, UserResponse,
 };
+use crate::validation::{validate_email, validate_name, validate_password, validate_username};
 use crate::AppState;
 
 // Public routes (no authentication required)
@@ -26,7 +29,8 @@ pub fn protected_routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/users", get(list_users))
         .route("/users/me", get(get_current_user))
-        .route("/users/{id}", get(get_user).put(update_user).delete(delete_user))
+        .route("/users/me/password", patch(change_password))
+        .route("/users/{id}", get(get_user).patch(update_user).delete(delete_user))
 }
 
 // POST /api/register
@@ -40,6 +44,26 @@ async fn register(
             StatusCode::BAD_REQUEST,
             Json(ApiResponse::error("All fields are required")),
         );
+    }
+
+    // Validate username
+    if let Err(e) = validate_username(&payload.username) {
+        return (StatusCode::BAD_REQUEST, Json(ApiResponse::error(e)));
+    }
+
+    // Validate name
+    if let Err(e) = validate_name(&payload.name) {
+        return (StatusCode::BAD_REQUEST, Json(ApiResponse::error(e)));
+    }
+
+    // Validate email
+    if let Err(e) = validate_email(&payload.email) {
+        return (StatusCode::BAD_REQUEST, Json(ApiResponse::error(e)));
+    }
+
+    // Validate password
+    if let Err(e) = validate_password(&payload.password) {
+        return (StatusCode::BAD_REQUEST, Json(ApiResponse::error(e)));
     }
 
     // Hash the password
@@ -186,11 +210,12 @@ async fn get_current_user(
     }
 }
 
-// GET /api/users - List users (superuser only)
+// GET /api/users - List users (superuser only) with pagination
 async fn list_users(
     Extension(auth_user): Extension<AuthUser>,
     State(state): State<Arc<AppState>>,
-) -> (StatusCode, Json<ApiResponse<Vec<UserResponse>>>) {
+    Query(pagination): Query<PaginationQuery>,
+) -> (StatusCode, Json<ApiResponse<PaginatedUsersResponse>>) {
     if !auth_user.is_superuser() {
         return (
             StatusCode::FORBIDDEN,
@@ -198,16 +223,45 @@ async fn list_users(
         );
     }
 
+    // Parse and validate pagination params
+    let page = pagination.page.unwrap_or(1).max(1);
+    let limit = pagination.limit.unwrap_or(20).clamp(1, 100);
+    let offset = (page - 1) * limit;
+
+    // Get total count
+    let total_result: Result<(i64,), _> = sqlx::query_as("SELECT COUNT(*) FROM users")
+        .fetch_one(&state.db.pool)
+        .await;
+
+    let total = match total_result {
+        Ok((count,)) => count as u32,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::error("Failed to count users")),
+            );
+        }
+    };
+
+    // Get paginated users
     let users: Result<Vec<User>, _> = sqlx::query_as(
-        "SELECT id, name, username, email, password_hash, role FROM users",
+        "SELECT id, name, username, email, password_hash, role FROM users ORDER BY id ASC LIMIT ? OFFSET ?",
     )
+    .bind(limit)
+    .bind(offset)
     .fetch_all(&state.db.pool)
     .await;
 
     match users {
         Ok(users) => {
             let user_responses: Vec<UserResponse> = users.into_iter().map(|u| u.into()).collect();
-            (StatusCode::OK, Json(ApiResponse::success(user_responses)))
+            let response = PaginatedUsersResponse {
+                users: user_responses,
+                page,
+                limit,
+                total,
+            };
+            (StatusCode::OK, Json(ApiResponse::success(response)))
         }
         Err(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -246,12 +300,12 @@ async fn get_user(
     }
 }
 
-// PUT /api/users/:id
+// PATCH /api/users/:id - Partial profile update (no password)
 async fn update_user(
     Extension(auth_user): Extension<AuthUser>,
     State(state): State<Arc<AppState>>,
     Path(id): Path<i32>,
-    Json(payload): Json<RegisterRequest>,
+    Json(payload): Json<UpdateUserRequest>,
 ) -> (StatusCode, Json<ApiResponse<UserResponse>>) {
     // Users can only update their own profile unless they are superuser
     if auth_user.id != id && !auth_user.is_superuser() {
@@ -261,8 +315,141 @@ async fn update_user(
         );
     }
 
-    // Hash the new password
-    let password_hash = match hash_password(&payload.password) {
+    // Check if at least one field is provided
+    if payload.name.is_none() && payload.username.is_none() && payload.email.is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::error("No fields to update")),
+        );
+    }
+
+    // Fetch current user data
+    let current_user: Result<User, _> = sqlx::query_as(
+        "SELECT id, name, username, email, password_hash, role FROM users WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_one(&state.db.pool)
+    .await;
+
+    let current_user = match current_user {
+        Ok(user) => user,
+        Err(_) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ApiResponse::error("User not found")),
+            );
+        }
+    };
+
+    // Apply updates with validation
+    let new_name = if let Some(ref name) = payload.name {
+        if let Err(e) = validate_name(name) {
+            return (StatusCode::BAD_REQUEST, Json(ApiResponse::error(e)));
+        }
+        name.clone()
+    } else {
+        current_user.name
+    };
+
+    let new_username = if let Some(ref username) = payload.username {
+        if let Err(e) = validate_username(username) {
+            return (StatusCode::BAD_REQUEST, Json(ApiResponse::error(e)));
+        }
+        username.clone()
+    } else {
+        current_user.username
+    };
+
+    let new_email = if let Some(ref email) = payload.email {
+        if let Err(e) = validate_email(email) {
+            return (StatusCode::BAD_REQUEST, Json(ApiResponse::error(e)));
+        }
+        email.clone()
+    } else {
+        current_user.email
+    };
+
+    // Update database (no password, no role)
+    let result = sqlx::query(
+        "UPDATE users SET name = ?, username = ?, email = ? WHERE id = ?",
+    )
+    .bind(&new_name)
+    .bind(&new_username)
+    .bind(&new_email)
+    .bind(id)
+    .execute(&state.db.pool)
+    .await;
+
+    match result {
+        Ok(res) if res.rows_affected() > 0 => {
+            let user_response = UserResponse {
+                id,
+                name: new_name,
+                username: new_username,
+                email: new_email,
+                role: current_user.role,
+            };
+            (StatusCode::OK, Json(ApiResponse::success(user_response)))
+        }
+        Ok(_) => (
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::error("User not found")),
+        ),
+        Err(e) => {
+            let error_msg = if e.to_string().contains("Duplicate entry") {
+                "Username or email already exists"
+            } else {
+                "Failed to update user"
+            };
+            (StatusCode::BAD_REQUEST, Json(ApiResponse::error(error_msg)))
+        }
+    }
+}
+
+// PATCH /api/users/me/password - Change password with verification
+async fn change_password(
+    Extension(auth_user): Extension<AuthUser>,
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<ChangePasswordRequest>,
+) -> (StatusCode, Json<ApiResponse<String>>) {
+    // Validate new password
+    if let Err(e) = validate_password(&payload.new_password) {
+        return (StatusCode::BAD_REQUEST, Json(ApiResponse::error(e)));
+    }
+
+    // Fetch current user's password hash
+    let user: Result<User, _> = sqlx::query_as(
+        "SELECT id, name, username, email, password_hash, role FROM users WHERE id = ?",
+    )
+    .bind(auth_user.id)
+    .fetch_one(&state.db.pool)
+    .await;
+
+    let user = match user {
+        Ok(user) => user,
+        Err(_) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ApiResponse::error("User not found")),
+            );
+        }
+    };
+
+    // Verify current password
+    match verify_password(&payload.current_password, &user.password_hash) {
+        Ok(true) => {
+            // Current password is correct, proceed with update
+        }
+        _ => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(ApiResponse::error("Current password is incorrect")),
+            );
+        }
+    }
+
+    // Hash new password
+    let new_password_hash = match hash_password(&payload.new_password) {
         Ok(hash) => hash,
         Err(_) => {
             return (
@@ -272,48 +459,21 @@ async fn update_user(
         }
     };
 
-    let result = sqlx::query(
-        "UPDATE users SET name = ?, username = ?, email = ?, password_hash = ? WHERE id = ?",
-    )
-    .bind(&payload.name)
-    .bind(&payload.username)
-    .bind(&payload.email)
-    .bind(&password_hash)
-    .bind(id)
-    .execute(&state.db.pool)
-    .await;
+    // Update password
+    let result = sqlx::query("UPDATE users SET password_hash = ? WHERE id = ?")
+        .bind(&new_password_hash)
+        .bind(auth_user.id)
+        .execute(&state.db.pool)
+        .await;
 
     match result {
-        Ok(res) if res.rows_affected() > 0 => {
-            // Fetch the updated user to get the role
-            let user: Result<User, _> = sqlx::query_as(
-                "SELECT id, name, username, email, password_hash, role FROM users WHERE id = ?",
-            )
-            .bind(id)
-            .fetch_one(&state.db.pool)
-            .await;
-
-            match user {
-                Ok(user) => (StatusCode::OK, Json(ApiResponse::success(user.into()))),
-                Err(_) => {
-                    let user_response = UserResponse {
-                        id,
-                        name: payload.name,
-                        username: payload.username,
-                        email: payload.email,
-                        role: auth_user.role.as_str().to_string(),
-                    };
-                    (StatusCode::OK, Json(ApiResponse::success(user_response)))
-                }
-            }
-        }
         Ok(_) => (
-            StatusCode::NOT_FOUND,
-            Json(ApiResponse::error("User not found")),
+            StatusCode::OK,
+            Json(ApiResponse::success("Password updated successfully".to_string())),
         ),
         Err(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiResponse::error("Failed to update user")),
+            Json(ApiResponse::error("Failed to update password")),
         ),
     }
 }

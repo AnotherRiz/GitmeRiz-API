@@ -12,6 +12,7 @@ pub enum Role {
 }
 
 impl Role {
+    #[allow(dead_code)]
     pub fn as_str(&self) -> &'static str {
         match self {
             Role::Superuser => "superuser",
@@ -79,6 +80,34 @@ pub struct RegisterRequest {
     pub username: String,
     pub email: String,
     pub password: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateUserRequest {
+    pub name: Option<String>,
+    pub username: Option<String>,
+    pub email: Option<String>,
+    // NOTE: no password, no role here - password updated via separate endpoint
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ChangePasswordRequest {
+    pub current_password: String,
+    pub new_password: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PaginationQuery {
+    pub page: Option<u32>,
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PaginatedUsersResponse {
+    pub users: Vec<UserResponse>,
+    pub page: u32,
+    pub limit: u32,
+    pub total: u32,
 }
 
 #[derive(Debug, Deserialize)]

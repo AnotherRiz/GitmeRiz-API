@@ -9,6 +9,12 @@ auth flow and how tokens/cookies are used.
 
 Public. Registers a new user with the default role `user`.
 
+**Validation Rules:**
+- **username**: 3-20 characters, only letters, numbers, and underscore (`_`). No spaces.
+- **name**: 2-50 characters, spaces allowed.
+- **email**: Must be a valid email format, max 255 characters.
+- **password**: Minimum 8 characters. Recommended: at least 1 uppercase letter and 1 digit.
+
 Request body:
 ```json
 {
@@ -34,7 +40,15 @@ Response `201`:
 ```
 
 Errors:
-- `400` — missing fields, or username/email already exists.
+- `400` — missing fields, validation failed, or username/email already exists.
+
+**Example validation error response:**
+```json
+{
+  "success": false,
+  "error": "Username must be 3-20 characters (letters, numbers, underscore only)"
+}
+```
 
 ```bash
 curl -X POST http://localhost:3000/register \
