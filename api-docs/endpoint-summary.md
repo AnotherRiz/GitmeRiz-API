@@ -29,11 +29,19 @@
 | PATCH | `/gallery/reorder-pins` | Yes | Persist custom order for pinned images (drag-and-drop support) (owner / superuser) |
 | POST | `/gallery/{id}/reprocess` | Yes | Retry thumbnail + preview generation - returns `202`, processes in background, poll `/gallery/status` (owner / superuser) |
 | DELETE | `/gallery/{id}` | Yes | Delete image + file (owner / superuser) |
-| GET | `/video` | Yes | List videos (own / all for superuser) |
-| POST | `/video` | Yes | Upload video (multipart, no size limit) |
-| GET | `/video/{id}` | Yes | Get video metadata (owner / superuser) |
-| GET | `/video/{id}/download` | Yes | Download video file (owner / superuser) |
-| DELETE | `/video/{id}` | Yes | Delete video + file (owner / superuser) |
+| GET | `/video/public` | No | List all public videos with cursor pagination - supports `?cursor={id}&limit=20` |
+| GET | `/video/me` | Yes | List current user's videos (public & private) with cursor pagination |
+| GET | `/video/me/pinned` | Yes | List current user's pinned videos (no pagination, max 4) |
+| POST | `/video` | Yes | Upload video(s) (multipart, no size limit, up to 5 files); returns `202`, processes in background via FFmpeg |
+| POST | `/video/status` | Yes | Check processing status of up to 100 video ids (own only) |
+| GET | `/video/{id}` | No | Get video metadata by numeric id (public) |
+| GET | `/video/d/{id}` | No | Download video file with attachment header (serves transcoded if available) |
+| GET | `/video/r/{short_id}` | Optional | Stream video inline with HTTP 206 Range support (public: no auth, private: cookie/header) |
+| GET | `/video/t/{short_id}` | Optional | Serve pre-generated thumbnail (WebP, cached 1 year) |
+| PATCH | `/video/{id}` | Yes | Unified partial update: title/visibility/pinned (owner / superuser) |
+| PATCH | `/video/reorder-pins` | Yes | Persist custom order for pinned videos (max 4, owner / superuser) |
+| POST | `/video/{id}/reprocess` | Yes | Retry FFmpeg thumbnail + transcoding - returns `202`, processes in background (owner / superuser) |
+| DELETE | `/video/{id}` | Yes | Delete video + all files (original, transcoded, thumbnail) (owner / superuser) |
 | GET | `/audio` | Yes | List audio (own / all for superuser) |
 | POST | `/audio` | Yes | Upload audio (multipart, no size limit) |
 | GET | `/audio/{id}` | Yes | Get audio metadata (owner / superuser) |

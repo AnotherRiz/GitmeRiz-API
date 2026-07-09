@@ -26,6 +26,7 @@ pub struct AppState {
     pub db: Database,
     pub config: Config,
     pub image_semaphore: Arc<Semaphore>,
+    pub video_semaphore: Arc<Semaphore>,
 }
 
 #[tokio::main]
@@ -53,20 +54,25 @@ async fn main() {
     let cpu_count = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
-    let permit_count = cpu_count.clamp(4, 8);
-    tracing::info!("Image processing semaphore initialized with {} permits", permit_count);
+    let image_permit_count = cpu_count.clamp(4, 8);
+    tracing::info!("Image processing semaphore initialized with {} permits", image_permit_count);
+
+    // Initialize semaphore for FFmpeg video processing (CPU-heavy, limit to 1-2)
+    let video_permit_count = (cpu_count / 2).clamp(1, 2);
+    tracing::info!("Video processing semaphore initialized with {} permits", video_permit_count);
 
     let state = Arc::new(AppState { 
         db, 
         config: config.clone(),
-        image_semaphore: Arc::new(Semaphore::new(permit_count)),
+        image_semaphore: Arc::new(Semaphore::new(image_permit_count)),
+        video_semaphore: Arc::new(Semaphore::new(video_permit_count)),
     });
 
     // Protected routes - require authentication
     let protected_routes = Router::new()
         .merge(users::protected_routes())
         .merge(gallery::protected_routes())
-        .merge(video::router())
+        .merge(video::protected_routes())
         .merge(audio::router())
         .merge(blog::router())
         .merge(notes::router())
@@ -89,6 +95,7 @@ async fn main() {
         .route("/health", get(health::health_check))
         .merge(users::public_routes())
         .merge(gallery::public_routes())
+        .merge(video::public_routes())
         .merge(protected_routes)
         .layer(cors)
         .layer(CookieManagerLayer::new())
