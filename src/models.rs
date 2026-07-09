@@ -120,6 +120,7 @@ pub struct LoginRequest {
 pub struct LoginResponse {
     pub message: String,
     pub token: String,
+    pub refresh_token: Option<String>,
     pub user: UserResponse,
 }
 

@@ -1,13 +1,14 @@
 use axum::{
-    extract::{Path, Query, State},
-    http::StatusCode,
+    extract::{Path, Query, State, ConnectInfo},
+    http::{StatusCode, HeaderMap},
     routing::{get, patch, post},
     Extension, Json, Router,
 };
 use std::sync::Arc;
+use std::net::SocketAddr;
 use tower_cookies::{Cookie, Cookies};
 
-use crate::auth::{create_token, hash_password, verify_password};
+use crate::auth::{create_token, generate_refresh_token, hash_password, verify_password};
 use crate::models::{
     ApiResponse, AuthUser, ChangePasswordRequest, LoginRequest, LoginResponse, 
     PaginatedUsersResponse, PaginationQuery, RegisterRequest, UpdateUserRequest, 
@@ -22,6 +23,7 @@ pub fn public_routes() -> Router<Arc<AppState>> {
         .route("/register", post(register))
         .route("/login", post(login))
         .route("/logout", post(logout))
+        .route("/refresh", post(refresh))
 }
 
 // Protected routes (authentication required) - middleware applied in main.rs
@@ -113,6 +115,8 @@ async fn register(
 // POST /api/login
 async fn login(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     cookies: Cookies,
     Json(payload): Json<LoginRequest>,
 ) -> (StatusCode, Json<ApiResponse<LoginResponse>>) {
@@ -129,7 +133,7 @@ async fn login(
             // Verify password
             match verify_password(&payload.password, &user.password_hash) {
                 Ok(true) => {
-                    // Create JWT token
+                    // Create JWT Access Token
                     let token = match create_token(
                         user.id,
                         &user.username,
@@ -140,23 +144,74 @@ async fn login(
                         Err(_) => {
                             return (
                                 StatusCode::INTERNAL_SERVER_ERROR,
-                                Json(ApiResponse::error("Failed to create token")),
+                                Json(ApiResponse::error("Failed to create access token")),
                             );
                         }
                     };
 
-                    // Set httpOnly cookie
-                    let mut cookie = Cookie::new("auth_token", token.clone());
-                    cookie.set_http_only(true);
-                    cookie.set_secure(false); // Set to true in production (HTTPS only)
-                    cookie.set_same_site(tower_cookies::cookie::SameSite::Lax); // Changed from None to Lax for localhost
-                    cookie.set_path("/");
-                    cookie.set_max_age(tower_cookies::cookie::time::Duration::days(365));
-                    cookies.add(cookie);
+                    // Generate Refresh Token
+                    let refresh_token = generate_refresh_token();
+                    
+                    // Extract client IP and User Agent
+                    let user_agent = headers
+                        .get("user-agent")
+                        .and_then(|h| h.to_str().ok())
+                        .map(|s| s.to_string());
+                    
+                    let ip_address = headers
+                        .get("x-forwarded-for")
+                        .and_then(|h| h.to_str().ok())
+                        .map(|s| s.split(',').next().unwrap_or("").trim().to_string())
+                        .unwrap_or_else(|| addr.ip().to_string());
+
+                    // Session ID and Expiration
+                    let session_id = uuid::Uuid::new_v4().to_string();
+                    let expires_at = chrono::Utc::now() + chrono::Duration::days(365);
+
+                    // Insert session to DB with SHA-256 hash of refresh token
+                    let session_insert = sqlx::query(
+                        "INSERT INTO sessions (id, user_id, refresh_token, user_agent, ip_address, expires_at) \
+                         VALUES (?, ?, SHA2(?, 256), ?, ?, ?)"
+                    )
+                    .bind(&session_id)
+                    .bind(user.id)
+                    .bind(&refresh_token)
+                    .bind(user_agent)
+                    .bind(ip_address)
+                    .bind(expires_at)
+                    .execute(&state.db.pool)
+                    .await;
+
+                    if let Err(e) = session_insert {
+                        tracing::error!("Failed to record session in database: {}", e);
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(ApiResponse::error("Failed to establish session")),
+                        );
+                    }
+
+                    // Set httpOnly cookie for Access Token (auth_token)
+                    let mut auth_cookie = Cookie::new("auth_token", token.clone());
+                    auth_cookie.set_http_only(true);
+                    auth_cookie.set_secure(false); // Set to true in production (HTTPS only)
+                    auth_cookie.set_same_site(tower_cookies::cookie::SameSite::Lax);
+                    auth_cookie.set_path("/");
+                    auth_cookie.set_max_age(tower_cookies::cookie::time::Duration::minutes(15));
+                    cookies.add(auth_cookie);
+
+                    // Set httpOnly cookie for Refresh Token (refresh_token)
+                    let mut refresh_cookie = Cookie::new("refresh_token", refresh_token.clone());
+                    refresh_cookie.set_http_only(true);
+                    refresh_cookie.set_secure(false); // Set to true in production (HTTPS only)
+                    refresh_cookie.set_same_site(tower_cookies::cookie::SameSite::Lax);
+                    refresh_cookie.set_path("/");
+                    refresh_cookie.set_max_age(tower_cookies::cookie::time::Duration::days(365));
+                    cookies.add(refresh_cookie);
 
                     let response = LoginResponse {
                         message: "Login successful".to_string(),
                         token,
+                        refresh_token: Some(refresh_token),
                         user: user.into(),
                     };
                     (StatusCode::OK, Json(ApiResponse::success(response)))
@@ -174,19 +229,179 @@ async fn login(
     }
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct LogoutRequest {
+    refresh_token: Option<String>,
+}
+
 // POST /api/logout
-async fn logout(cookies: Cookies) -> (StatusCode, Json<ApiResponse<String>>) {
-    // Clear the cookie by setting max_age to 0
-    let mut cookie = Cookie::new("auth_token", "");
-    cookie.set_http_only(true);
-    cookie.set_path("/");
-    cookie.set_max_age(tower_cookies::cookie::time::Duration::seconds(0));
-    cookies.add(cookie);
+async fn logout(
+    State(state): State<Arc<AppState>>,
+    cookies: Cookies,
+    payload: Option<Json<LogoutRequest>>,
+) -> (StatusCode, Json<ApiResponse<String>>) {
+    // Get refresh token from cookie or request body
+    let refresh_token = cookies
+        .get("refresh_token")
+        .map(|c| c.value().to_string())
+        .or_else(|| payload.and_then(|Json(p)| p.refresh_token.clone()));
+
+    if let Some(token) = refresh_token {
+        // Mark session as revoked in database using SHA-256 hash
+        let update_result = sqlx::query(
+            "UPDATE sessions SET is_revoked = TRUE WHERE refresh_token = SHA2(?, 256)"
+        )
+        .bind(token)
+        .execute(&state.db.pool)
+        .await;
+
+        if let Err(e) = update_result {
+            tracing::error!("Failed to revoke session on logout: {}", e);
+        }
+    }
+
+    // Clear access token cookie (auth_token)
+    let mut auth_cookie = Cookie::new("auth_token", "");
+    auth_cookie.set_http_only(true);
+    auth_cookie.set_path("/");
+    auth_cookie.set_max_age(tower_cookies::cookie::time::Duration::seconds(0));
+    cookies.add(auth_cookie);
+
+    // Clear refresh token cookie (refresh_token)
+    let mut refresh_cookie = Cookie::new("refresh_token", "");
+    refresh_cookie.set_http_only(true);
+    refresh_cookie.set_path("/");
+    refresh_cookie.set_max_age(tower_cookies::cookie::time::Duration::seconds(0));
+    cookies.add(refresh_cookie);
 
     (
         StatusCode::OK,
         Json(ApiResponse::success("Logged out successfully".to_string())),
     )
+}
+
+#[derive(sqlx::FromRow)]
+struct SessionUser {
+    id: String,
+    user_id: i32,
+    username: String,
+    role: String,
+}
+
+// POST /api/refresh
+async fn refresh(
+    State(state): State<Arc<AppState>>,
+    cookies: Cookies,
+) -> (StatusCode, Json<ApiResponse<LoginResponse>>) {
+    // 1. Get refresh token from cookie
+    let refresh_token = match cookies.get("refresh_token").map(|c| c.value().to_string()) {
+        Some(t) => t,
+        None => return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::error("Missing refresh token")),
+        ),
+    };
+
+    // 2. Query sessions in DB (using SHA2-256)
+    let session: Result<Option<SessionUser>, _> = sqlx::query_as(
+        "SELECT s.id, s.user_id, u.username, u.role FROM sessions s \
+         JOIN users u ON s.user_id = u.id \
+         WHERE s.refresh_token = SHA2(?, 256) AND s.is_revoked = FALSE AND s.expires_at > NOW()"
+    )
+    .bind(&refresh_token)
+    .fetch_optional(&state.db.pool)
+    .await;
+
+    let session_data = match session {
+        Ok(Some(row)) => row,
+        Ok(None) => return (
+            StatusCode::UNAUTHORIZED,
+            Json(ApiResponse::error("Invalid or expired session")),
+        ),
+        Err(e) => {
+            tracing::error!("Database error in refresh token validation: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::error("Internal database error")),
+            );
+        }
+    };
+
+    // 3. Generate new Access Token (JWT, 15 min)
+    let new_access_token = match create_token(
+        session_data.user_id,
+        &session_data.username,
+        &session_data.role,
+        &state.config.jwt_secret,
+    ) {
+        Ok(t) => t,
+        Err(_) => return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse::error("Failed to generate access token")),
+        ),
+    };
+
+    // 4. Generate new Refresh Token
+    let new_refresh_token = generate_refresh_token();
+
+    // 5. Update database: replace refresh_token, last_active = NOW()
+    let update_result = sqlx::query(
+        "UPDATE sessions SET refresh_token = SHA2(?, 256), last_active = NOW() WHERE id = ?"
+    )
+    .bind(&new_refresh_token)
+    .bind(&session_data.id)
+    .execute(&state.db.pool)
+    .await;
+
+    if let Err(e) = update_result {
+        tracing::error!("Failed to update refresh token in database: {}", e);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse::error("Failed to update session")),
+        );
+    }
+
+    // 6. Query user details for LoginResponse
+    let user_res: Result<User, _> = sqlx::query_as(
+        "SELECT id, name, username, email, password_hash, role FROM users WHERE id = ?",
+    )
+    .bind(session_data.user_id)
+    .fetch_one(&state.db.pool)
+    .await;
+
+    let user = match user_res {
+        Ok(u) => u,
+        Err(_) => return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse::error("User not found")),
+        ),
+    };
+
+    // 7. Set cookies
+    let mut auth_cookie = Cookie::new("auth_token", new_access_token.clone());
+    auth_cookie.set_http_only(true);
+    auth_cookie.set_secure(false); // Set to true in production (HTTPS only)
+    auth_cookie.set_same_site(tower_cookies::cookie::SameSite::Lax);
+    auth_cookie.set_path("/");
+    auth_cookie.set_max_age(tower_cookies::cookie::time::Duration::minutes(15));
+    cookies.add(auth_cookie);
+
+    let mut refresh_cookie = Cookie::new("refresh_token", new_refresh_token.clone());
+    refresh_cookie.set_http_only(true);
+    refresh_cookie.set_secure(false); // Set to true in production (HTTPS only)
+    refresh_cookie.set_same_site(tower_cookies::cookie::SameSite::Lax);
+    refresh_cookie.set_path("/");
+    refresh_cookie.set_max_age(tower_cookies::cookie::time::Duration::days(365));
+    cookies.add(refresh_cookie);
+
+    let response = LoginResponse {
+        message: "Token refreshed successfully".to_string(),
+        token: new_access_token,
+        refresh_token: Some(new_refresh_token),
+        user: user.into(),
+    };
+
+    (StatusCode::OK, Json(ApiResponse::success(response)))
 }
 
 // GET /api/users/me - Get current authenticated user
