@@ -23,7 +23,7 @@ bcrypt = "0.17"
 # JWT
 jsonwebtoken = "9"
 # MySQL database (async)
-sqlx = { version = "0.8", features = ["runtime-tokio", "mysql"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "mysql", "chrono"] }
 # Environment variables
 dotenvy = "0.15"
 # Tracing / logging

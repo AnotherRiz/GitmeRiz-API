@@ -16,7 +16,7 @@ pub fn verify_password(password: &str, hash: &str) -> Result<bool, bcrypt::Bcryp
 // JWT token creation
 pub fn create_token(user_id: i32, username: &str, role: &str, secret: &str) -> Result<String, jsonwebtoken::errors::Error> {
     let now = Utc::now();
-    let exp = now + Duration::days(365); // Token valid for 365 days (1 year)
+    let exp = now + Duration::minutes(15); // Token valid for 15 minutes
 
     let claims = Claims {
         sub: user_id,
@@ -31,6 +31,11 @@ pub fn create_token(user_id: i32, username: &str, role: &str, secret: &str) -> R
         &claims,
         &EncodingKey::from_secret(secret.as_bytes()),
     )
+}
+
+// Generate an opaque Refresh Token (random UUID)
+pub fn generate_refresh_token() -> String {
+    uuid::Uuid::new_v4().to_string()
 }
 
 // JWT token validation

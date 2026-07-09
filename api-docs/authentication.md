@@ -58,7 +58,7 @@ curl -X POST http://localhost:3000/register \
 
 ## POST /login
 
-Public. Verifies credentials, sets an `auth_token` HttpOnly cookie, and returns a JWT token.
+Public. Verifies credentials, sets `auth_token` (Access Token, short-lived) and `refresh_token` (Refresh Token, long-lived) HttpOnly cookies, and returns user info + both tokens in JSON response.
 
 Request body:
 ```json
@@ -75,6 +75,7 @@ Response `200`:
   "data": {
     "message": "Login successful",
     "token": "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9...",
+    "refresh_token": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
     "user": {
       "id": 1,
       "name": "John Doe",
@@ -86,9 +87,10 @@ Response `200`:
 }
 ```
 
-On success the server also sends a cookie:
+On success the server also sends cookies:
 ```
-Set-Cookie: auth_token=eyJ0eXAi...; HttpOnly; SameSite=Lax; Path=/; Max-Age=31536000
+Set-Cookie: auth_token=eyJ0eXAi...; HttpOnly; SameSite=Lax; Path=/; Max-Age=900 (15 minutes)
+Set-Cookie: refresh_token=f47ac10b...; HttpOnly; SameSite=Lax; Path=/; Max-Age=31536000 (1 year)
 ```
 
 Errors:
@@ -102,8 +104,7 @@ curl -X POST http://localhost:3000/login \
 
 ## POST /logout
 
-Public. Clears the `auth_token` cookie by expiring it. Safe to call even without a
-valid session.
+Public. Revokes the user session in the database and clears both `auth_token` and `refresh_token` cookies. Safe to call even without a valid session.
 
 Response `200`:
 ```json
@@ -113,11 +114,52 @@ Response `200`:
 }
 ```
 
-The response expires the cookie:
+The response expires the cookies:
 ```
 Set-Cookie: auth_token=; HttpOnly; Path=/; Max-Age=0
+Set-Cookie: refresh_token=; HttpOnly; Path=/; Max-Age=0
 ```
 
 ```bash
 curl -X POST http://localhost:3000/logout
+```
+
+## POST /refresh
+
+Public. Rotates the Access Token (JWT) and Refresh Token by validating the current `refresh_token` cookie.
+
+Request:
+Requires the `refresh_token` HttpOnly cookie to be present.
+
+Response `200`:
+```json
+{
+  "success": true,
+  "data": {
+    "message": "Token refreshed successfully",
+    "token": "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9...",
+    "refresh_token": "a57de98b-18cc-4372-b567-1e02c2d3e589",
+    "user": {
+      "id": 1,
+      "name": "John Doe",
+      "username": "john",
+      "email": "john@example.com",
+      "role": "user"
+    }
+  }
+}
+```
+
+On success the server also sends cookies:
+```
+Set-Cookie: auth_token=eyJ0eXAi...; HttpOnly; SameSite=Lax; Path=/; Max-Age=900 (15 minutes)
+Set-Cookie: refresh_token=a57de98b...; HttpOnly; SameSite=Lax; Path=/; Max-Age=31536000 (1 year)
+```
+
+Errors:
+- `400` — missing `refresh_token` cookie.
+- `401` — invalid, expired (beyond 1 year), or revoked session.
+
+```bash
+curl -X POST http://localhost:3000/refresh
 ```

@@ -317,6 +317,26 @@ impl Database {
         .execute(&self.pool)
         .await?;
 
+        // Create sessions table
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS sessions (
+                id VARCHAR(255) PRIMARY KEY,
+                user_id INT NOT NULL,
+                refresh_token VARCHAR(255) NOT NULL,
+                user_agent TEXT,
+                ip_address VARCHAR(45),
+                last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                is_revoked BOOLEAN DEFAULT FALSE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                expires_at TIMESTAMP NOT NULL,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
         tracing::info!("Database migrations completed");
         Ok(())
     }

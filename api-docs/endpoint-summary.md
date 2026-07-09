@@ -6,8 +6,9 @@
 |--------|----------|------|-------|
 | GET | `/health` | No | Health check |
 | POST | `/register` | No | Register (role `user`), validates username/name/email/password |
-| POST | `/login` | No | Login, sets `auth_token` cookie + returns JWT |
-| POST | `/logout` | No | Clears the `auth_token` cookie |
+| POST | `/login` | No | Login, sets `auth_token` & `refresh_token` cookies + returns tokens |
+| POST | `/logout` | No | Clears `auth_token` & `refresh_token` cookies, revokes session in DB |
+| POST | `/refresh` | No | Rotates Access Token and Refresh Token using `refresh_token` cookie |
 | GET | `/users/me` | Yes | Current user |
 | GET | `/users` | Yes | List users with pagination (superuser) - supports `?page=1&limit=20` |
 | GET | `/users/{id}` | Yes | Get user (self or superuser) |
