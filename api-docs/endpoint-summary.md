@@ -36,9 +36,8 @@
 | POST | `/video/status` | Yes | Check processing status of up to 100 video ids (own only) |
 | GET | `/video/{id}` | No | Get video metadata by numeric id (public) |
 | GET | `/video/d/{id}` | No | Download video file with attachment header (serves transcoded if available) |
-| GET | `/video/r/{short_id}` | Optional | Stream video inline with HTTP 206 Range support (public: no auth, private: signed URL/cookie/header) |
+| GET | `/video/r/{short_id}` | Optional | Stream video inline with HTTP 206 Range support (public: no auth, private: cookie/header) |
 | GET | `/video/t/{short_id}` | Optional | Serve pre-generated thumbnail (WebP, cached 1 year) |
-| POST | `/video/{short_id}/sign` | Yes | Generate 15-minute signed URL for private video access (owner / superuser) |
 | PATCH | `/video/{id}` | Yes | Unified partial update: title/visibility/pinned (owner / superuser) |
 | PATCH | `/video/reorder-pins` | Yes | Persist custom order for pinned videos (max 4, owner / superuser) |
 | POST | `/video/{id}/reprocess` | Yes | Retry FFmpeg thumbnail + transcoding - returns `202`, processes in background (owner / superuser) |

@@ -85,11 +85,7 @@ struct ReorderPinsRequest {
     ordered_ids: Vec<i32>,
 }
 
-#[derive(Debug, Serialize)]
-struct SignedUrlResponse {
-    url: String,
-    expires: i64,
-}
+
 
 // ─── Routes ────────────────────────────────────────────────────────────────────
 
@@ -113,7 +109,6 @@ pub fn protected_routes() -> Router<Arc<AppState>> {
         .route("/video/reorder-pins", patch(reorder_pins))
         .route("/video/{id}", patch(update_video).delete(delete_video))
         .route("/video/{id}/reprocess", post(reprocess_video))
-        .route("/video/{short_id}/sign", post(sign_video_url))
 }
 
 // ─── Helpers ───────────────────────────────────────────────────────────────────
@@ -146,72 +141,6 @@ fn extract_optional_auth(
         })
 }
 
-/// Generate an HMAC-SHA256 signed URL for private video access
-fn generate_signed_url(short_id: &str, secret: &str, expires_at: i64) -> String {
-    use hmac::{Hmac, Mac, digest::KeyInit};
-    use sha2::Sha256;
-
-    type HmacSha256 = Hmac<Sha256>;
-    let message = format!("{}:{}", short_id, expires_at);
-    let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
-        .expect("HMAC can take key of any size");
-    mac.update(message.as_bytes());
-    let sig = hex::encode(mac.finalize().into_bytes());
-
-    format!("/video/r/{}?expires={}&sig={}", short_id, expires_at, sig)
-}
-
-/// Validate a signed URL's signature and expiry
-fn validate_signed_url(short_id: &str, secret: &str, query: &HashMap<String, String>) -> bool {
-    use hmac::{Hmac, Mac, digest::KeyInit};
-    use sha2::Sha256;
-
-    let expires_str = match query.get("expires") {
-        Some(e) => e,
-        None => return false,
-    };
-    let sig = match query.get("sig") {
-        Some(s) => s,
-        None => return false,
-    };
-
-    let expires: i64 = match expires_str.parse() {
-        Ok(e) => e,
-        Err(_) => return false,
-    };
-
-    // Check expiry
-    let now = chrono::Utc::now().timestamp();
-    if now > expires {
-        return false;
-    }
-
-    // Verify HMAC
-    type HmacSha256 = Hmac<Sha256>;
-    let message = format!("{}:{}", short_id, expires);
-    let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
-        .expect("HMAC can take key of any size");
-    mac.update(message.as_bytes());
-
-    let expected_sig = hex::encode(mac.finalize().into_bytes());
-    sig == &expected_sig
-}
-
-/// Extract query parameters from a URI as a HashMap
-fn extract_query_params(uri: &axum::http::Uri) -> HashMap<String, String> {
-    uri.query()
-        .map(|q| {
-            q.split('&')
-                .filter_map(|pair| {
-                    let mut parts = pair.splitn(2, '=');
-                    let key = parts.next()?;
-                    let value = parts.next().unwrap_or("");
-                    Some((key.to_string(), value.to_string()))
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
 
 /// Determine the servable file path for a video (transcoded if available, otherwise original)
 fn get_servable_path(item: &VideoItem) -> &str {
@@ -889,7 +818,6 @@ async fn serve_video_stream(
     Path(short_id): Path<String>,
     cookies: Cookies,
     headers: HeaderMap,
-    request: axum::extract::Request,
 ) -> impl IntoResponse {
     let item: Result<VideoItem, _> = sqlx::query_as(&format!(
         "SELECT {} FROM videos WHERE short_id = ?",
@@ -913,32 +841,26 @@ async fn serve_video_stream(
 
     // Access control for private videos
     if item.visibility == "private" {
-        // Check signed URL first
-        let query_params = extract_query_params(request.uri());
-        let has_valid_signature = validate_signed_url(&short_id, &state.config.jwt_secret, &query_params);
-
-        if !has_valid_signature {
-            // Fall back to cookie/header auth
-            let auth_user = extract_optional_auth(&cookies, &headers, &state.config.jwt_secret);
-            match auth_user {
-                Some(user) => {
-                    if item.user_id != user.id && !user.is_superuser() {
-                        return build_error_response(
-                            StatusCode::FORBIDDEN,
-                            "You can only access your own private videos",
-                            &headers,
-                            &state.config.frontend_url,
-                        );
-                    }
-                }
-                None => {
+        // Fall back to cookie/header auth
+        let auth_user = extract_optional_auth(&cookies, &headers, &state.config.jwt_secret);
+        match auth_user {
+            Some(user) => {
+                if item.user_id != user.id && !user.is_superuser() {
                     return build_error_response(
-                        StatusCode::UNAUTHORIZED,
-                        "This video is private. Authentication required.",
+                        StatusCode::FORBIDDEN,
+                        "You can only access your own private videos",
                         &headers,
                         &state.config.frontend_url,
                     );
                 }
+            }
+            None => {
+                return build_error_response(
+                    StatusCode::UNAUTHORIZED,
+                    "This video is private. Authentication required.",
+                    &headers,
+                    &state.config.frontend_url,
+                );
             }
         }
     }
@@ -1071,7 +993,6 @@ async fn serve_video_thumbnail(
     Path(short_id): Path<String>,
     cookies: Cookies,
     headers: HeaderMap,
-    request: axum::extract::Request,
 ) -> impl IntoResponse {
     let item: Result<VideoItem, _> = sqlx::query_as(&format!(
         "SELECT {} FROM videos WHERE short_id = ?",
@@ -1095,30 +1016,25 @@ async fn serve_video_thumbnail(
 
     // Access control (same rules as /video/r/)
     if item.visibility == "private" {
-        let query_params = extract_query_params(request.uri());
-        let has_valid_signature = validate_signed_url(&short_id, &state.config.jwt_secret, &query_params);
-
-        if !has_valid_signature {
-            let auth_user = extract_optional_auth(&cookies, &headers, &state.config.jwt_secret);
-            match auth_user {
-                Some(user) => {
-                    if item.user_id != user.id && !user.is_superuser() {
-                        return build_error_response(
-                            StatusCode::FORBIDDEN,
-                            "You can only access your own private videos",
-                            &headers,
-                            &state.config.frontend_url,
-                        );
-                    }
-                }
-                None => {
+        let auth_user = extract_optional_auth(&cookies, &headers, &state.config.jwt_secret);
+        match auth_user {
+            Some(user) => {
+                if item.user_id != user.id && !user.is_superuser() {
                     return build_error_response(
-                        StatusCode::UNAUTHORIZED,
-                        "This video is private. Authentication required.",
+                        StatusCode::FORBIDDEN,
+                        "You can only access your own private videos",
                         &headers,
                         &state.config.frontend_url,
                     );
                 }
+            }
+            None => {
+                return build_error_response(
+                    StatusCode::UNAUTHORIZED,
+                    "This video is private. Authentication required.",
+                    &headers,
+                    &state.config.frontend_url,
+                );
             }
         }
     }
@@ -1156,47 +1072,7 @@ async fn serve_video_thumbnail(
     }
 }
 
-// POST /video/{short_id}/sign — Generate signed URL for private video
-async fn sign_video_url(
-    Extension(auth_user): Extension<AuthUser>,
-    State(state): State<Arc<AppState>>,
-    Path(short_id): Path<String>,
-) -> (StatusCode, Json<ApiResponse<SignedUrlResponse>>) {
-    let item: Result<VideoItem, _> = sqlx::query_as(&format!(
-        "SELECT {} FROM videos WHERE short_id = ?",
-        VIDEO_COLUMNS
-    ))
-    .bind(&short_id)
-    .fetch_one(&state.db.pool)
-    .await;
 
-    let item = match item {
-        Ok(item) => item,
-        Err(_) => {
-            return (StatusCode::NOT_FOUND, Json(ApiResponse::error("Video not found")));
-        }
-    };
-
-    // Only owner or superuser can generate signed URLs
-    if item.user_id != auth_user.id && !auth_user.is_superuser() {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(ApiResponse::error("You can only sign URLs for your own videos")),
-        );
-    }
-
-    // 15-minute expiry
-    let expires_at = chrono::Utc::now().timestamp() + (15 * 60);
-    let url = generate_signed_url(&short_id, &state.config.jwt_secret, expires_at);
-
-    (
-        StatusCode::OK,
-        Json(ApiResponse::success(SignedUrlResponse {
-            url,
-            expires: expires_at,
-        })),
-    )
-}
 
 // PATCH /video/{id} — Unified partial update (title, visibility, pinned)
 async fn update_video(

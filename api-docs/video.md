@@ -160,30 +160,11 @@ Downloads the video file with `Content-Disposition: attachment`. Public endpoint
 
 Serves the video file inline for HTML5 `<video>` tags. Supports HTTP `Range` requests for scrubbing.
 
-**Access rules:**
-
-* **Public videos**: No auth required.
-* **Private videos**: Requires signed URL (`?expires={ts}&sig={sig}`), Cookie (`auth_token`), or `Authorization: Bearer` header.
+* **Private videos**: Requires Cookie (`auth_token`) or `Authorization: Bearer` header.
 
 ## GET /video/t/{short_id}
 
 Serves the **pre-generated thumbnail** (WebP) extracted from the video by FFmpeg. Cached for 1 year. Access rules match `GET /video/r/{short_id}`.
-
-## POST /video/{short_id}/sign
-
-Generates a **signed URL** for a private video. **Requires authentication.** Owner or superuser only. Valid for 15 minutes. Works for both `/r/` streaming and `/t/` thumbnail endpoints.
-
-Response `200`:
-
-```json
-{
-  "success": true,
-  "data": {
-    "url": "/video/r/vX9mP2qL?expires=1752072000&sig=a1b2c3...",
-    "expires": 1752072000
-  }
-}
-```
 
 ## PATCH /video/{id}
 
