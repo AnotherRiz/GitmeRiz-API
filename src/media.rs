@@ -280,3 +280,47 @@ pub fn generate_thumbnail_and_preview(image_data: &[u8]) -> Result<(Vec<u8>, Vec
     
     Ok((thumb_encoded.to_vec(), preview_encoded.to_vec()))
 }
+
+/// Generate transcoded video path from original stored path
+/// Converts: video/2026/07/2026-07-01/2026-07-01_15-15-01_UUID.mkv
+/// To:       video/2026/07/2026-07-01/2026-07-01_15-15-01_UUID-web.mp4
+pub fn generate_transcoded_path(original_stored_path: &str) -> String {
+    let path_without_ext = if let Some(pos) = original_stored_path.rfind('.') {
+        &original_stored_path[..pos]
+    } else {
+        original_stored_path
+    };
+    format!("{}-web.mp4", path_without_ext)
+}
+
+/// Check if a video extension is web-safe (can be played natively in HTML5 <video>)
+/// Web-safe formats don't need transcoding.
+pub fn is_web_safe_video(extension: &str) -> bool {
+    let ext_lower = extension.to_lowercase();
+    matches!(ext_lower.as_str(), ".mp4" | ".webm")
+}
+
+/// Save a multipart field to disk by streaming chunks (avoids loading entire file into memory).
+/// Returns the total number of bytes written.
+pub async fn save_file_streaming(
+    path: &PathBuf,
+    field: &mut axum::extract::multipart::Field<'_>,
+) -> Result<u64, std::io::Error> {
+    use tokio::io::AsyncWriteExt;
+
+    ensure_directory_exists(path).await?;
+    let mut file = tokio::fs::File::create(path).await?;
+    let mut total_bytes: u64 = 0;
+
+    while let Some(chunk) = field
+        .chunk()
+        .await
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
+    {
+        file.write_all(&chunk).await?;
+        total_bytes += chunk.len() as u64;
+    }
+
+    file.flush().await?;
+    Ok(total_bytes)
+}

@@ -246,6 +246,140 @@ impl Database {
         .execute(&self.pool)
         .await?;
 
+        // --- Video table column migrations (idempotent) ---
+
+        // Add visibility column to videos
+        let has_video_visibility = matches!(
+            sqlx::query("SHOW COLUMNS FROM videos LIKE 'visibility'")
+                .fetch_optional(&self.pool)
+                .await,
+            Ok(Some(_))
+        );
+        if !has_video_visibility {
+            tracing::info!("Adding visibility column to videos table");
+            sqlx::query("ALTER TABLE videos ADD COLUMN visibility ENUM('public', 'private') NOT NULL DEFAULT 'private'")
+                .execute(&self.pool)
+                .await?;
+        }
+
+        // Add short_id column to videos (with backfill)
+        let has_video_short_id = matches!(
+            sqlx::query("SHOW COLUMNS FROM videos LIKE 'short_id'")
+                .fetch_optional(&self.pool)
+                .await,
+            Ok(Some(_))
+        );
+        if !has_video_short_id {
+            tracing::info!("Adding short_id column to videos table");
+            // Add column as nullable first
+            sqlx::query("ALTER TABLE videos ADD COLUMN short_id CHAR(8)")
+                .execute(&self.pool)
+                .await?;
+
+            // Backfill existing rows with unique short_ids
+            let existing_rows: Vec<(i32,)> = sqlx::query_as("SELECT id FROM videos WHERE short_id IS NULL")
+                .fetch_all(&self.pool)
+                .await?;
+
+            for (id,) in existing_rows {
+                loop {
+                    let short_id = crate::media::generate_short_id();
+                    let result = sqlx::query("UPDATE videos SET short_id = ? WHERE id = ?")
+                        .bind(&short_id)
+                        .bind(id)
+                        .execute(&self.pool)
+                        .await;
+
+                    if result.is_ok() {
+                        break;
+                    }
+                    // If collision, retry with new short_id
+                }
+            }
+
+            // Now make it NOT NULL and UNIQUE
+            sqlx::query("ALTER TABLE videos MODIFY COLUMN short_id CHAR(8) NOT NULL")
+                .execute(&self.pool)
+                .await?;
+            sqlx::query("ALTER TABLE videos ADD UNIQUE KEY unique_video_short_id (short_id)")
+                .execute(&self.pool)
+                .await?;
+
+            tracing::info!("Videos short_id column added and backfilled successfully");
+        }
+
+        // Add thumbnail_path column to videos
+        let has_video_thumbnail = matches!(
+            sqlx::query("SHOW COLUMNS FROM videos LIKE 'thumbnail_path'")
+                .fetch_optional(&self.pool)
+                .await,
+            Ok(Some(_))
+        );
+        if !has_video_thumbnail {
+            tracing::info!("Adding thumbnail_path column to videos table");
+            sqlx::query("ALTER TABLE videos ADD COLUMN thumbnail_path VARCHAR(512)")
+                .execute(&self.pool)
+                .await?;
+        }
+
+        // Add transcoded_path column to videos (for web-safe mp4 when original is mkv/avi/mov)
+        let has_video_transcoded = matches!(
+            sqlx::query("SHOW COLUMNS FROM videos LIKE 'transcoded_path'")
+                .fetch_optional(&self.pool)
+                .await,
+            Ok(Some(_))
+        );
+        if !has_video_transcoded {
+            tracing::info!("Adding transcoded_path column to videos table");
+            sqlx::query("ALTER TABLE videos ADD COLUMN transcoded_path VARCHAR(512)")
+                .execute(&self.pool)
+                .await?;
+        }
+
+        // Add pinned column to videos
+        let has_video_pinned = matches!(
+            sqlx::query("SHOW COLUMNS FROM videos LIKE 'pinned'")
+                .fetch_optional(&self.pool)
+                .await,
+            Ok(Some(_))
+        );
+        if !has_video_pinned {
+            tracing::info!("Adding pinned column to videos table");
+            sqlx::query("ALTER TABLE videos ADD COLUMN pinned BOOLEAN NOT NULL DEFAULT FALSE")
+                .execute(&self.pool)
+                .await?;
+        }
+
+        // Add pin_order column to videos
+        let has_video_pin_order = matches!(
+            sqlx::query("SHOW COLUMNS FROM videos LIKE 'pin_order'")
+                .fetch_optional(&self.pool)
+                .await,
+            Ok(Some(_))
+        );
+        if !has_video_pin_order {
+            tracing::info!("Adding pin_order column to videos table");
+            sqlx::query("ALTER TABLE videos ADD COLUMN pin_order INT NOT NULL DEFAULT 0")
+                .execute(&self.pool)
+                .await?;
+        }
+
+        // Add status column to videos
+        let has_video_status = matches!(
+            sqlx::query("SHOW COLUMNS FROM videos LIKE 'status'")
+                .fetch_optional(&self.pool)
+                .await,
+            Ok(Some(_))
+        );
+        if !has_video_status {
+            tracing::info!("Adding status column to videos table");
+            sqlx::query(
+                "ALTER TABLE videos ADD COLUMN status ENUM('processing', 'active', 'failed_processing') NOT NULL DEFAULT 'active'"
+            )
+            .execute(&self.pool)
+            .await?;
+        }
+
         // Create audio table with file storage columns
         sqlx::query(
             r#"
