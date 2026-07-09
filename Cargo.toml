@@ -2,6 +2,7 @@
 name = "gitmeriz-api"
 version = "0.1.0"
 edition = "2024"
+default-run = "gitmeriz-api"
 
 [dependencies]
 # Web framework

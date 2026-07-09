@@ -95,6 +95,8 @@ async fn main() {
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
+use std::net::SocketAddr;
+
     // Start server
     let addr = format!("{}:{}", config.server_host, config.server_port);
     let listener = tokio::net::TcpListener::bind(&addr)
@@ -103,7 +105,7 @@ async fn main() {
 
     tracing::info!("Server running on http://{}", addr);
 
-    axum::serve(listener, app)
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
         .await
         .expect("Server error");
 }
