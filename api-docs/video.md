@@ -25,7 +25,7 @@ and a `status`.
 - Concurrent FFmpeg tasks are limited to **1–2** via `tokio::sync::Semaphore`.
 - The upload endpoint responds with `202 Accepted` as soon as the raw files are saved.
 - **FFmpeg Pipeline:**
-  1. **Thumbnail Extraction:** Extracts a single frame (tries `00:00:01`, falls back to `00:00:00` for short videos) and saves it as a WebP image (max width 500px).
+  1. **Thumbnail Extraction:** Extracts a single frame (tries `00:00:01`, falls back to `00:00:00` for short videos) and saves it as a WebP image (max width 1280px).
   2. **Transcoding (If needed):** If the uploaded video is not web-safe (e.g., `.mkv` or `.avi`), FFmpeg transcodes it to `.mp4` (H.264 video, AAC audio, `-movflags +faststart`).
 - Freshly uploaded items start with `status: "processing"`. Once FFmpeg finishes, `status` becomes `active`.
 - Poll `POST /video/status` to detect when processing has finished.

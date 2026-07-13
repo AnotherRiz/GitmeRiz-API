@@ -166,9 +166,9 @@ async fn ffmpeg_extract_thumbnail(input_path: &str, output_path: &str) -> Result
             "-ss", "00:00:01",
             "-i", input_path,
             "-vframes", "1",
-            "-vf", "scale=500:-1",
+            "-vf", "scale=1280:-1",
             "-c:v", "libwebp",
-            "-quality", "80",
+            "-quality", "90",
             output_path,
         ])
         .stdout(std::process::Stdio::null())
@@ -192,9 +192,9 @@ async fn ffmpeg_extract_thumbnail(input_path: &str, output_path: &str) -> Result
             "-ss", "00:00:00",
             "-i", input_path,
             "-vframes", "1",
-            "-vf", "scale=500:-1",
+            "-vf", "scale=1280:-1",
             "-c:v", "libwebp",
-            "-quality", "80",
+            "-quality", "90",
             output_path,
         ])
         .stdout(std::process::Stdio::null())
