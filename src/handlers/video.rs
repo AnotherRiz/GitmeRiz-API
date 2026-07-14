@@ -26,13 +26,15 @@ use crate::AppState;
 // ─── Data Structures ───────────────────────────────────────────────────────────
 
 /// Column list used in all SELECT queries (keep in sync with VideoItem struct)
-const VIDEO_COLUMNS: &str = "id, user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, transcoded_path, pinned, status, pin_order";
+const VIDEO_COLUMNS: &str = "id, user_id, title, description, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, transcoded_path, pinned, status, processing_progress, pin_order";
 
 #[derive(Debug, FromRow, Serialize, Clone)]
 pub struct VideoItem {
     pub id: i32,
     pub user_id: i32,
     pub title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     pub original_filename: String,
     pub stored_path: String,
     pub size_bytes: i64,
@@ -45,6 +47,7 @@ pub struct VideoItem {
     pub transcoded_path: Option<String>,
     pub pinned: bool,
     pub status: String,
+    pub processing_progress: i32,
     pub pin_order: i32,
 }
 
@@ -71,6 +74,7 @@ struct VideoPageResponse {
 #[derive(Debug, Deserialize)]
 struct UpdateVideoRequest {
     title: Option<String>,
+    description: Option<String>,
     visibility: Option<String>,
     pinned: Option<bool>,
 }
@@ -95,6 +99,8 @@ pub fn public_routes() -> Router<Arc<AppState>> {
         .route("/video/public", get(list_public_videos))
         .route("/video/{id}", get(get_video))
         .route("/video/d/{id}", get(download_video))
+        .route("/video/info/{short_id}", get(get_video_by_short_id))
+        .route("/video/download/{short_id}", get(download_video_by_short_id))
         .route("/video/r/{short_id}", get(serve_video_stream))
         .route("/video/t/{short_id}", get(serve_video_thumbnail))
 }
@@ -210,9 +216,49 @@ async fn ffmpeg_extract_thumbnail(input_path: &str, output_path: &str) -> Result
     }
 }
 
-/// Run FFmpeg to transcode a video to web-safe MP4 (H.264 + AAC + faststart).
-async fn ffmpeg_transcode_to_mp4(input_path: &str, output_path: &str) -> Result<(), String> {
-    let result = tokio::process::Command::new("ffmpeg")
+async fn get_video_duration(input_path: &str) -> Option<f64> {
+    let output = tokio::process::Command::new("ffprobe")
+        .args([
+            "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            input_path,
+        ])
+        .output()
+        .await
+        .ok()?;
+    
+    if !output.status.success() {
+        return None;
+    }
+    
+    let s = String::from_utf8_lossy(&output.stdout);
+    s.trim().parse::<f64>().ok()
+}
+
+fn parse_ffmpeg_time(time_str: &str) -> Option<f64> {
+    // Format: HH:MM:SS.MS (e.g. 00:01:23.45)
+    let parts: Vec<&str> = time_str.split(':').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let hours = parts[0].parse::<f64>().ok()?;
+    let minutes = parts[1].parse::<f64>().ok()?;
+    let seconds = parts[2].parse::<f64>().ok()?;
+    Some(hours * 3600.0 + minutes * 60.0 + seconds)
+}
+
+/// Run FFmpeg to transcode a video to web-safe MP4 (H.264 + AAC + faststart) with progress updates.
+async fn ffmpeg_transcode_to_mp4(
+    input_path: &str,
+    output_path: &str,
+    db_pool: &sqlx::MySqlPool,
+    item_id: i32,
+    total_duration: Option<f64>,
+) -> Result<(), String> {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    let mut child = tokio::process::Command::new("ffmpeg")
         .args([
             "-y",
             "-i", input_path,
@@ -226,9 +272,52 @@ async fn ffmpeg_transcode_to_mp4(input_path: &str, output_path: &str) -> Result<
         ])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
-        .status()
-        .await
+        .spawn()
         .map_err(|e| format!("Failed to spawn ffmpeg for transcoding: {}", e))?;
+
+    let stderr = child.stderr.take().ok_or("Failed to open stderr")?;
+    let mut reader = BufReader::new(stderr);
+    let mut buf = Vec::new();
+
+    tracing::info!(item_id, "Started video transcoding. Duration: {:?}", total_duration);
+
+    let mut last_progress = 30;
+    while let Ok(n) = reader.read_until(b'\r', &mut buf).await {
+        if n == 0 {
+            break;
+        }
+        let line = String::from_utf8_lossy(&buf);
+        if let Some(total_sec) = total_duration {
+            if total_sec > 0.0 {
+                if let Some(time_pos) = line.find("time=") {
+                    let time_str = &line[time_pos + 5..];
+                    let end_pos = time_str.find(char::is_whitespace).unwrap_or(time_str.len());
+                    let time_chunk = &time_str[..end_pos];
+                    
+                    if let Some(current_sec) = parse_ffmpeg_time(time_chunk) {
+                        let pct = current_sec / total_sec;
+                        // Transcoding progress scales from 30% to 99%
+                        let progress = 30 + ((pct * 69.0) as i32);
+                        let progress = progress.clamp(30, 99);
+                        
+                        if progress > last_progress {
+                            last_progress = progress;
+                            tracing::info!(item_id, "Video transcoding progress: {}%", progress);
+                            let _ = sqlx::query("UPDATE videos SET processing_progress = ? WHERE id = ?")
+                                .bind(progress)
+                                .bind(item_id)
+                                .execute(db_pool)
+                                .await;
+                        }
+                    }
+                }
+            }
+        }
+        buf.clear();
+    }
+
+    let result = child.wait().await
+        .map_err(|e| format!("Failed to wait for ffmpeg: {}", e))?;
 
     if result.success() {
         Ok(())
@@ -236,6 +325,161 @@ async fn ffmpeg_transcode_to_mp4(input_path: &str, output_path: &str) -> Result<
         Err("FFmpeg transcoding to MP4 failed".to_string())
     }
 }
+
+/// Spawns a background task to process a video (thumbnail extraction + transcoding).
+/// This respects the parallel processing semaphores in AppState.
+pub fn spawn_background_processing(
+    state: Arc<AppState>,
+    item_id: i32,
+    stored_path: String,
+    filename: String,
+) {
+    let db_pool = state.db.pool.clone();
+    let storage_dir = state.config.storage_dir.clone();
+    let semaphore = state.video_semaphore.clone();
+    let extension = get_extension(&filename).unwrap_or_default();
+    let batch_id = uuid::Uuid::new_v4();
+
+    tokio::spawn(async move {
+        tracing::info!(%batch_id, item_id, %filename, "Background video processing task started");
+
+        let _permit = match semaphore.acquire_owned().await {
+            Ok(p) => p,
+            Err(_) => {
+                tracing::error!(%batch_id, item_id, "Failed to acquire video processing semaphore");
+                let _ = sqlx::query("UPDATE videos SET status = 'failed_processing' WHERE id = ?")
+                    .bind(item_id)
+                    .execute(&db_pool)
+                    .await;
+                return;
+            }
+        };
+
+        // Set initial progress to 10%
+        let _ = sqlx::query("UPDATE videos SET processing_progress = 10 WHERE id = ?")
+            .bind(item_id)
+            .execute(&db_pool)
+            .await;
+
+        let input_full_path = std::path::PathBuf::from(&storage_dir).join(&stored_path);
+        let input_path_str = input_full_path.to_string_lossy().to_string();
+
+        // Fetch video duration
+        let duration = get_video_duration(&input_path_str).await;
+        tracing::info!(%batch_id, item_id, ?duration, "Video duration fetched");
+
+        // Step 1: Thumbnail extraction
+        let thumb_relative = generate_thumbnail_path(&stored_path);
+        let thumb_full_path = std::path::PathBuf::from(&storage_dir).join(&thumb_relative);
+
+        if let Some(parent) = thumb_full_path.parent() {
+            let _ = tokio::fs::create_dir_all(parent).await;
+        }
+
+        let thumb_result = ffmpeg_extract_thumbnail(
+            &input_path_str,
+            &thumb_full_path.to_string_lossy(),
+        )
+        .await;
+
+        let final_thumb = if thumb_result.is_ok() {
+            tracing::info!(%batch_id, item_id, %filename, "Thumbnail extracted successfully");
+            Some(thumb_relative)
+        } else {
+            tracing::warn!(%batch_id, item_id, %filename, "Thumbnail extraction failed: {:?}", thumb_result.err());
+            None
+        };
+
+        // Update progress to 30% after thumbnail
+        let _ = sqlx::query("UPDATE videos SET processing_progress = 30 WHERE id = ?")
+            .bind(item_id)
+            .execute(&db_pool)
+            .await;
+
+        // Step 2: Transcoding (if not web-safe)
+        let final_transcoded = if !is_web_safe_video(&extension) {
+            let transcoded_relative = generate_transcoded_path(&stored_path);
+            let transcoded_full_path = std::path::PathBuf::from(&storage_dir).join(&transcoded_relative);
+
+            if let Some(parent) = transcoded_full_path.parent() {
+                let _ = tokio::fs::create_dir_all(parent).await;
+            }
+
+            let transcode_result = ffmpeg_transcode_to_mp4(
+                &input_path_str,
+                &transcoded_full_path.to_string_lossy(),
+                &db_pool,
+                item_id,
+                duration,
+            )
+            .await;
+
+            if transcode_result.is_ok() {
+                tracing::info!(%batch_id, item_id, %filename, "Transcoding to MP4 successful");
+                Some(transcoded_relative)
+            } else {
+                tracing::error!(%batch_id, item_id, %filename, "Transcoding failed: {:?}", transcode_result.err());
+                None
+            }
+        } else {
+            tracing::info!(%batch_id, item_id, %filename, "Video is web-safe, skipping transcoding");
+            None
+        };
+
+        // Step 3: Update database
+        if final_thumb.is_some() || is_web_safe_video(&extension) {
+            let _ = sqlx::query(
+                "UPDATE videos SET status = 'active', thumbnail_path = ?, transcoded_path = ?, processing_progress = 100 WHERE id = ?"
+            )
+            .bind(&final_thumb)
+            .bind(&final_transcoded)
+            .bind(item_id)
+            .execute(&db_pool)
+            .await;
+
+            tracing::info!(%batch_id, item_id, "Video activated");
+        } else {
+            let _ = sqlx::query("UPDATE videos SET status = 'failed_processing' WHERE id = ?")
+                .bind(item_id)
+                .execute(&db_pool)
+                .await;
+
+            tracing::error!(%batch_id, item_id, "Video processing failed");
+        }
+
+        tracing::info!(%batch_id, item_id, "Background video processing completed");
+    }.instrument(tracing::info_span!("video_bg_process", %batch_id, item_id)));
+}
+
+/// Scans the database on startup to resume processing for any videos left in the 'processing' state.
+pub async fn resume_processing_on_startup(state: Arc<AppState>) {
+    tracing::info!("Checking for unfinished video processing tasks to resume...");
+    
+    let pending_videos: Result<Vec<(i32, String, String)>, _> = sqlx::query_as(
+        "SELECT id, stored_path, original_filename FROM videos WHERE status = 'processing'"
+    )
+    .fetch_all(&state.db.pool)
+    .await;
+
+    match pending_videos {
+        Ok(videos) => {
+            if videos.is_empty() {
+                tracing::info!("No unfinished video processing tasks found.");
+                return;
+            }
+            
+            tracing::info!("Found {} unfinished video processing tasks. Resuming...", videos.len());
+            for (id, stored_path, filename) in videos {
+                tracing::info!(id, %filename, "Resuming background processing for video");
+                spawn_background_processing(state.clone(), id, stored_path, filename);
+            }
+        }
+        Err(e) => {
+            tracing::error!("Failed to fetch pending videos on startup: {:?}", e);
+        }
+    }
+}
+
 
 // ─── Handlers ──────────────────────────────────────────────────────────────────
 
@@ -375,6 +619,7 @@ async fn upload_video(
     let batch_id = Uuid::new_v4();
 
     let mut title: Option<String> = None;
+    let mut description: Option<String> = None;
     let mut visibility = "private".to_string();
 
     // Struct to hold saved file info before DB insert
@@ -383,7 +628,6 @@ async fn upload_video(
         stored_path: String,
         full_path: std::path::PathBuf,
         size_bytes: u64,
-        extension: String,
         mime_type: &'static str,
     }
 
@@ -397,6 +641,14 @@ async fn upload_video(
             "title" => {
                 if let Ok(text) = field.text().await {
                     title = Some(text);
+                }
+            }
+            "description" => {
+                if let Ok(text) = field.text().await {
+                    let trimmed = text.trim();
+                    if !trimmed.is_empty() {
+                        description = Some(trimmed.to_string());
+                    }
                 }
             }
             "visibility" => {
@@ -466,7 +718,6 @@ async fn upload_video(
                     stored_path,
                     full_path,
                     size_bytes,
-                    extension,
                     mime_type,
                 });
             }
@@ -530,10 +781,11 @@ async fn upload_video(
         };
 
         let result = sqlx::query(
-            "INSERT INTO videos (user_id, title, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'processing')",
+            "INSERT INTO videos (user_id, title, description, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'processing')",
         )
         .bind(auth_user.id)
         .bind(&item_title)
+        .bind(&description)
         .bind(&sf.original_filename)
         .bind(&sf.stored_path)
         .bind(sf.size_bytes as i64)
@@ -549,6 +801,7 @@ async fn upload_video(
                     id: res.last_insert_id() as i32,
                     user_id: auth_user.id,
                     title: item_title,
+                    description: description.clone(),
                     original_filename: sf.original_filename.clone(),
                     stored_path: sf.stored_path.clone(),
                     size_bytes: sf.size_bytes as i64,
@@ -559,6 +812,7 @@ async fn upload_video(
                     transcoded_path: None,
                     pinned: false,
                     status: "processing".to_string(),
+                    processing_progress: 0,
                     pin_order: 0,
                 });
             }
@@ -586,112 +840,14 @@ async fn upload_video(
     tracing::info!(%batch_id, total_uploaded = uploaded_items.len(), "Raw video files saved, spawning FFmpeg background processing");
 
     // ── PHASE 2: Spawn background FFmpeg processing ──────────────────────────
-    let db_pool = state.db.pool.clone();
-    let storage_dir = state.config.storage_dir.clone();
-    let semaphore = state.video_semaphore.clone();
-
-    // Collect processing info from saved_files + uploaded_items
-    let process_items: Vec<(i32, String, String, String)> = uploaded_items
-        .iter()
-        .zip(saved_files.iter())
-        .map(|(item, sf)| (item.id, sf.stored_path.clone(), sf.extension.clone(), sf.original_filename.clone()))
-        .collect();
-
-    tokio::spawn(async move {
-        tracing::info!(%batch_id, "Video background processing started");
-
-        for (item_id, stored_path, extension, filename) in &process_items {
-            let _permit = match semaphore.clone().acquire_owned().await {
-                Ok(p) => p,
-                Err(_) => {
-                    tracing::error!(%batch_id, item_id, "Failed to acquire video processing semaphore");
-                    let _ = sqlx::query("UPDATE videos SET status = 'failed_processing' WHERE id = ?")
-                        .bind(item_id)
-                        .execute(&db_pool)
-                        .await;
-                    continue;
-                }
-            };
-
-            let input_full_path = std::path::PathBuf::from(&storage_dir).join(stored_path);
-            let input_path_str = input_full_path.to_string_lossy().to_string();
-
-            // Step 1: Thumbnail extraction
-            let thumb_relative = generate_thumbnail_path(stored_path);
-            let thumb_full_path = std::path::PathBuf::from(&storage_dir).join(&thumb_relative);
-
-            // Ensure parent directory exists
-            if let Some(parent) = thumb_full_path.parent() {
-                let _ = tokio::fs::create_dir_all(parent).await;
-            }
-
-            let thumb_result = ffmpeg_extract_thumbnail(
-                &input_path_str,
-                &thumb_full_path.to_string_lossy(),
-            )
-            .await;
-
-            let final_thumb = if thumb_result.is_ok() {
-                tracing::info!(%batch_id, item_id, %filename, "Thumbnail extracted successfully");
-                Some(thumb_relative)
-            } else {
-                tracing::warn!(%batch_id, item_id, %filename, "Thumbnail extraction failed: {:?}", thumb_result.err());
-                None
-            };
-
-            // Step 2: Transcoding (if not web-safe)
-            let final_transcoded = if !is_web_safe_video(extension) {
-                let transcoded_relative = generate_transcoded_path(stored_path);
-                let transcoded_full_path = std::path::PathBuf::from(&storage_dir).join(&transcoded_relative);
-
-                if let Some(parent) = transcoded_full_path.parent() {
-                    let _ = tokio::fs::create_dir_all(parent).await;
-                }
-
-                let transcode_result = ffmpeg_transcode_to_mp4(
-                    &input_path_str,
-                    &transcoded_full_path.to_string_lossy(),
-                )
-                .await;
-
-                if transcode_result.is_ok() {
-                    tracing::info!(%batch_id, item_id, %filename, "Transcoding to MP4 successful");
-                    Some(transcoded_relative)
-                } else {
-                    tracing::error!(%batch_id, item_id, %filename, "Transcoding failed: {:?}", transcode_result.err());
-                    None
-                }
-            } else {
-                tracing::info!(%batch_id, item_id, %filename, "Video is web-safe, skipping transcoding");
-                None
-            };
-
-            // Step 3: Update database
-            // Consider it successful if at least the thumbnail was generated
-            // (transcoding failure for non-web-safe is also tolerable — original can still be served)
-            if final_thumb.is_some() || is_web_safe_video(extension) {
-                let _ = sqlx::query(
-                    "UPDATE videos SET status = 'active', thumbnail_path = ?, transcoded_path = ? WHERE id = ?"
-                )
-                .bind(&final_thumb)
-                .bind(&final_transcoded)
-                .bind(item_id)
-                .execute(&db_pool)
-                .await;
-
-                tracing::info!(%batch_id, item_id, "Video activated");
-            } else {
-                let _ = sqlx::query("UPDATE videos SET status = 'failed_processing' WHERE id = ?")
-                    .bind(item_id)
-                    .execute(&db_pool)
-                    .await;
-
-                tracing::error!(%batch_id, item_id, "Video processing failed");
-            }
-        }
-
-        tracing::info!(%batch_id, "Video background processing fully completed");
-    }.instrument(tracing::info_span!("video_bg_process", %batch_id)));
+    for item in &uploaded_items {
+        spawn_background_processing(
+            state.clone(),
+            item.id,
+            item.stored_path.clone(),
+            item.original_filename.clone(),
+        );
+    }
 
     // ── PHASE 3: Return 202 Accepted immediately ─────────────────────────────
     if num_files == 1 {
@@ -724,11 +880,11 @@ async fn check_status(
 
     let placeholders = payload.ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
     let query = format!(
-        "SELECT id, status FROM videos WHERE id IN ({}) AND user_id = ?",
+        "SELECT id, status, processing_progress FROM videos WHERE id IN ({}) AND user_id = ?",
         placeholders
     );
 
-    let mut query_builder = sqlx::query_as::<_, (i32, String)>(&query);
+    let mut query_builder = sqlx::query_as::<_, (i32, String, i32)>(&query);
     for id in &payload.ids {
         query_builder = query_builder.bind(id);
     }
@@ -736,7 +892,17 @@ async fn check_status(
 
     match query_builder.fetch_all(&state.db.pool).await {
         Ok(rows) => {
-            let status_map: HashMap<i32, String> = rows.into_iter().collect();
+            let status_map: HashMap<i32, String> = rows
+                .into_iter()
+                .map(|(id, status, progress)| {
+                    let status_str = if status == "processing" {
+                        format!("processing:{}", progress)
+                    } else {
+                        status
+                    };
+                    (id, status_str)
+                })
+                .collect();
             (StatusCode::OK, Json(ApiResponse::success(status_map)))
         }
         Err(e) => {
@@ -752,25 +918,8 @@ async fn check_status(
 // GET /video/{id} — Get video metadata (public endpoint)
 async fn get_video(
     State(state): State<Arc<AppState>>,
-    Path(id): Path<i32>,
-) -> (StatusCode, Json<ApiResponse<VideoItem>>) {
-    let item: Result<VideoItem, _> = sqlx::query_as(&format!(
-        "SELECT {} FROM videos WHERE id = ?",
-        VIDEO_COLUMNS
-    ))
-    .bind(id)
-    .fetch_one(&state.db.pool)
-    .await;
-
-    match item {
-        Ok(item) => (StatusCode::OK, Json(ApiResponse::success(item))),
-        Err(_) => (StatusCode::NOT_FOUND, Json(ApiResponse::error("Video not found"))),
-    }
-}
-
-// GET /video/d/{id} — Download video file (attachment header)
-async fn download_video(
-    State(state): State<Arc<AppState>>,
+    cookies: Cookies,
+    headers: HeaderMap,
     Path(id): Path<i32>,
 ) -> impl IntoResponse {
     let item: Result<VideoItem, _> = sqlx::query_as(&format!(
@@ -783,6 +932,83 @@ async fn download_video(
 
     match item {
         Ok(item) => {
+            // Access control for private videos
+            if item.visibility == "private" {
+                let auth_user = extract_optional_auth(&cookies, &headers, &state.config.jwt_secret);
+                match auth_user {
+                    Some(user) => {
+                        if item.user_id != user.id && !user.is_superuser() {
+                            return build_error_response(
+                                StatusCode::FORBIDDEN,
+                                "You can only access your own private videos",
+                                &headers,
+                                &state.config.frontend_url,
+                            );
+                        }
+                    }
+                    None => {
+                        return build_error_response(
+                            StatusCode::UNAUTHORIZED,
+                            "This video is private. Authentication required.",
+                            &headers,
+                            &state.config.frontend_url,
+                        );
+                    }
+                }
+            }
+            (StatusCode::OK, Json(ApiResponse::success(item))).into_response()
+        }
+        Err(_) => build_error_response(
+            StatusCode::NOT_FOUND,
+            "Video not found",
+            &headers,
+            &state.config.frontend_url,
+        ),
+    }
+}
+
+// GET /video/d/{id} — Download video file (attachment header)
+async fn download_video(
+    State(state): State<Arc<AppState>>,
+    cookies: Cookies,
+    headers: HeaderMap,
+    Path(id): Path<i32>,
+) -> impl IntoResponse {
+    let item: Result<VideoItem, _> = sqlx::query_as(&format!(
+        "SELECT {} FROM videos WHERE id = ?",
+        VIDEO_COLUMNS
+    ))
+    .bind(id)
+    .fetch_one(&state.db.pool)
+    .await;
+
+    match item {
+        Ok(item) => {
+            // Access control for private videos
+            if item.visibility == "private" {
+                let auth_user = extract_optional_auth(&cookies, &headers, &state.config.jwt_secret);
+                match auth_user {
+                    Some(user) => {
+                        if item.user_id != user.id && !user.is_superuser() {
+                            return build_error_response(
+                                StatusCode::FORBIDDEN,
+                                "You can only access your own private videos",
+                                &headers,
+                                &state.config.frontend_url,
+                            );
+                        }
+                    }
+                    None => {
+                        return build_error_response(
+                            StatusCode::UNAUTHORIZED,
+                            "This video is private. Authentication required.",
+                            &headers,
+                            &state.config.frontend_url,
+                        );
+                    }
+                }
+            }
+
             let serve_path = get_servable_path(&item);
             match crate::media::read_file(&state.config.storage_dir, serve_path).await {
                 Ok(data) => {
@@ -796,21 +1022,151 @@ async fn download_video(
                         )
                         .body(body)
                         .unwrap()
+                        .into_response()
                 }
-                Err(_) => (
+                Err(_) => build_error_response(
                     StatusCode::NOT_FOUND,
-                    Json(ApiResponse::<()>::error("File not found on disk")),
-                )
-                    .into_response(),
+                    "File not found on disk",
+                    &headers,
+                    &state.config.frontend_url,
+                ),
             }
         }
-        Err(_) => (
+        Err(_) => build_error_response(
             StatusCode::NOT_FOUND,
-            Json(ApiResponse::<()>::error("Video not found")),
-        )
-            .into_response(),
+            "Video not found",
+            &headers,
+            &state.config.frontend_url,
+        ),
     }
 }
+
+// GET /video/info/{short_id} — Get video metadata by short_id (public endpoint)
+async fn get_video_by_short_id(
+    State(state): State<Arc<AppState>>,
+    cookies: Cookies,
+    headers: HeaderMap,
+    Path(short_id): Path<String>,
+) -> impl IntoResponse {
+    let item: Result<VideoItem, _> = sqlx::query_as(&format!(
+        "SELECT {} FROM videos WHERE short_id = ?",
+        VIDEO_COLUMNS
+    ))
+    .bind(&short_id)
+    .fetch_one(&state.db.pool)
+    .await;
+
+    match item {
+        Ok(item) => {
+            // Access control for private videos
+            if item.visibility == "private" {
+                let auth_user = extract_optional_auth(&cookies, &headers, &state.config.jwt_secret);
+                match auth_user {
+                    Some(user) => {
+                        if item.user_id != user.id && !user.is_superuser() {
+                            return build_error_response(
+                                StatusCode::FORBIDDEN,
+                                "You can only access your own private videos",
+                                &headers,
+                                &state.config.frontend_url,
+                            );
+                        }
+                    }
+                    None => {
+                        return build_error_response(
+                            StatusCode::UNAUTHORIZED,
+                            "This video is private. Authentication required.",
+                            &headers,
+                            &state.config.frontend_url,
+                        );
+                    }
+                }
+            }
+            (StatusCode::OK, Json(ApiResponse::success(item))).into_response()
+        }
+        Err(_) => build_error_response(
+            StatusCode::NOT_FOUND,
+            "Video not found",
+            &headers,
+            &state.config.frontend_url,
+        ),
+    }
+}
+
+// GET /video/download/{short_id} — Download video file by short_id (attachment header)
+async fn download_video_by_short_id(
+    State(state): State<Arc<AppState>>,
+    cookies: Cookies,
+    headers: HeaderMap,
+    Path(short_id): Path<String>,
+) -> impl IntoResponse {
+    let item: Result<VideoItem, _> = sqlx::query_as(&format!(
+        "SELECT {} FROM videos WHERE short_id = ?",
+        VIDEO_COLUMNS
+    ))
+    .bind(&short_id)
+    .fetch_one(&state.db.pool)
+    .await;
+
+    match item {
+        Ok(item) => {
+            // Access control for private videos
+            if item.visibility == "private" {
+                let auth_user = extract_optional_auth(&cookies, &headers, &state.config.jwt_secret);
+                match auth_user {
+                    Some(user) => {
+                        if item.user_id != user.id && !user.is_superuser() {
+                            return build_error_response(
+                                StatusCode::FORBIDDEN,
+                                "You can only access your own private videos",
+                                &headers,
+                                &state.config.frontend_url,
+                            );
+                        }
+                    }
+                    None => {
+                        return build_error_response(
+                            StatusCode::UNAUTHORIZED,
+                            "This video is private. Authentication required.",
+                            &headers,
+                            &state.config.frontend_url,
+                        );
+                    }
+                }
+            }
+
+            let serve_path = get_servable_path(&item);
+            match crate::media::read_file(&state.config.storage_dir, serve_path).await {
+                Ok(data) => {
+                    let body = Body::from(data);
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, get_servable_mime(&item))
+                        .header(
+                            header::CONTENT_DISPOSITION,
+                            format!("attachment; filename=\"{}\"", item.original_filename),
+                        )
+                        .body(body)
+                        .unwrap()
+                        .into_response()
+                }
+                Err(_) => build_error_response(
+                    StatusCode::NOT_FOUND,
+                    "File not found on disk",
+                    &headers,
+                    &state.config.frontend_url,
+                ),
+            }
+        }
+        Err(_) => build_error_response(
+            StatusCode::NOT_FOUND,
+            "Video not found",
+            &headers,
+            &state.config.frontend_url,
+        ),
+    }
+}
+
 
 // GET /video/r/{short_id} — Serve video inline with HTTP Range support for streaming
 async fn serve_video_stream(
@@ -1083,7 +1439,7 @@ async fn update_video(
 ) -> (StatusCode, Json<ApiResponse<VideoItem>>) {
     const MAX_PINNED_VIDEOS: i64 = 4;
 
-    if payload.title.is_none() && payload.visibility.is_none() && payload.pinned.is_none() {
+    if payload.title.is_none() && payload.description.is_none() && payload.visibility.is_none() && payload.pinned.is_none() {
         return (
             StatusCode::BAD_REQUEST,
             Json(ApiResponse::error("No fields to update")),
@@ -1124,6 +1480,19 @@ async fn update_video(
         title.clone()
     } else {
         item.title.clone()
+    };
+
+    // Apply description
+    let new_description = match payload.description {
+        Some(ref desc) => {
+            let trimmed = desc.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        }
+        None => item.description.clone(),
     };
 
     // Validate and apply visibility
@@ -1204,9 +1573,10 @@ async fn update_video(
 
     // Update database
     let result = sqlx::query(
-        "UPDATE videos SET title = ?, visibility = ?, pinned = ?, pin_order = ? WHERE id = ?",
+        "UPDATE videos SET title = ?, description = ?, visibility = ?, pinned = ?, pin_order = ? WHERE id = ?",
     )
     .bind(&new_title)
+    .bind(&new_description)
     .bind(&new_visibility)
     .bind(new_pinned)
     .bind(new_pin_order)
@@ -1217,6 +1587,7 @@ async fn update_video(
     match result {
         Ok(_) => {
             item.title = new_title;
+            item.description = new_description;
             item.visibility = new_visibility;
             item.pinned = new_pinned;
             item.pin_order = new_pin_order;
@@ -1424,8 +1795,6 @@ async fn reprocess_video(
     State(state): State<Arc<AppState>>,
     Path(id): Path<i32>,
 ) -> (StatusCode, Json<ApiResponse<VideoItem>>) {
-    use uuid::Uuid;
-
     let item: Result<VideoItem, _> = sqlx::query_as(&format!(
         "SELECT {} FROM videos WHERE id = ?",
         VIDEO_COLUMNS
@@ -1457,8 +1826,8 @@ async fn reprocess_video(
         );
     }
 
-    // Set status to processing
-    if let Err(e) = sqlx::query("UPDATE videos SET status = 'processing' WHERE id = ?")
+    // Set status to processing and progress to 0
+    if let Err(e) = sqlx::query("UPDATE videos SET status = 'processing', processing_progress = 0 WHERE id = ?")
         .bind(id)
         .execute(&state.db.pool)
         .await
@@ -1470,100 +1839,16 @@ async fn reprocess_video(
         );
     }
 
-    let batch_id = Uuid::new_v4();
-    tracing::info!(%batch_id, item_id = id, "Queued video reprocessing (returning 202 Accepted)");
-
-    let db_pool = state.db.pool.clone();
-    let storage_dir = state.config.storage_dir.clone();
-    let semaphore = state.video_semaphore.clone();
-    let item_id = item.id;
-    let stored_path = item.stored_path.clone();
-    let extension = get_extension(&item.original_filename).unwrap_or_default();
-    let filename = item.original_filename.clone();
-
-    tokio::spawn(async move {
-        tracing::info!(%batch_id, item_id, %filename, "Background video reprocessing started");
-
-        let _permit = match semaphore.acquire_owned().await {
-            Ok(p) => p,
-            Err(_) => {
-                tracing::error!(%batch_id, item_id, "Failed to acquire video processing semaphore");
-                let _ = sqlx::query("UPDATE videos SET status = 'failed_processing' WHERE id = ?")
-                    .bind(item_id)
-                    .execute(&db_pool)
-                    .await;
-                return;
-            }
-        };
-
-        let input_full_path = std::path::PathBuf::from(&storage_dir).join(&stored_path);
-        let input_path_str = input_full_path.to_string_lossy().to_string();
-
-        // Thumbnail
-        let thumb_relative = generate_thumbnail_path(&stored_path);
-        let thumb_full_path = std::path::PathBuf::from(&storage_dir).join(&thumb_relative);
-
-        if let Some(parent) = thumb_full_path.parent() {
-            let _ = tokio::fs::create_dir_all(parent).await;
-        }
-
-        let final_thumb = match ffmpeg_extract_thumbnail(&input_path_str, &thumb_full_path.to_string_lossy()).await {
-            Ok(_) => {
-                tracing::info!(%batch_id, item_id, "Reprocess: thumbnail extracted");
-                Some(thumb_relative)
-            }
-            Err(e) => {
-                tracing::warn!(%batch_id, item_id, "Reprocess: thumbnail failed: {}", e);
-                None
-            }
-        };
-
-        // Transcoding
-        let final_transcoded = if !is_web_safe_video(&extension) {
-            let transcoded_relative = generate_transcoded_path(&stored_path);
-            let transcoded_full_path = std::path::PathBuf::from(&storage_dir).join(&transcoded_relative);
-
-            if let Some(parent) = transcoded_full_path.parent() {
-                let _ = tokio::fs::create_dir_all(parent).await;
-            }
-
-            match ffmpeg_transcode_to_mp4(&input_path_str, &transcoded_full_path.to_string_lossy()).await {
-                Ok(_) => {
-                    tracing::info!(%batch_id, item_id, "Reprocess: transcoding successful");
-                    Some(transcoded_relative)
-                }
-                Err(e) => {
-                    tracing::error!(%batch_id, item_id, "Reprocess: transcoding failed: {}", e);
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
-        if final_thumb.is_some() || is_web_safe_video(&extension) {
-            let _ = sqlx::query(
-                "UPDATE videos SET status = 'active', thumbnail_path = ?, transcoded_path = ? WHERE id = ?"
-            )
-            .bind(&final_thumb)
-            .bind(&final_transcoded)
-            .bind(item_id)
-            .execute(&db_pool)
-            .await;
-            tracing::info!(%batch_id, item_id, "Reprocess: video activated");
-        } else {
-            let _ = sqlx::query("UPDATE videos SET status = 'failed_processing' WHERE id = ?")
-                .bind(item_id)
-                .execute(&db_pool)
-                .await;
-            tracing::error!(%batch_id, item_id, "Reprocess: video processing failed");
-        }
-
-        tracing::info!(%batch_id, "Background video reprocessing completed");
-    }.instrument(tracing::info_span!("video_bg_reprocess", %batch_id, item_id)));
+    spawn_background_processing(
+        state.clone(),
+        item.id,
+        item.stored_path.clone(),
+        item.original_filename.clone(),
+    );
 
     let mut response_item = item;
     response_item.status = "processing".to_string();
+    response_item.processing_progress = 0;
 
     (StatusCode::ACCEPTED, Json(ApiResponse::success(response_item)))
 }

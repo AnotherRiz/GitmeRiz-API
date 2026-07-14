@@ -42,6 +42,7 @@ and a `status`.
   "id": 1,
   "user_id": 1,
   "title": "Vacation Clip",
+  "description": "A beautiful view of the beach",
   "original_filename": "raw_footage.mkv",
   "stored_path": "video/2026/06/2026-06-30/2026-06-30_14-25-10_UUID.mkv",
   "size_bytes": 104857600,
@@ -124,6 +125,7 @@ Uploads video file(s). **Requires authentication.** Uses `multipart/form-data`:
 | --- | --- | --- |
 | `file` | Yes | The video file(s). Bulk upload max 5 files. |
 | `title` | No | Display title (used for single uploads). |
+| `description` | No | Video description. |
 | `visibility` | No | `public` or `private`. Defaults to `private`. |
 
 **Upload process:**
@@ -150,11 +152,23 @@ Response `202` (single file):
 
 ## GET /video/{id}
 
-Returns a single video's metadata by numeric id. Public endpoint.
+Returns a single video's metadata by numeric id. Public endpoint for public videos.
+* **Access rules**: Public videos are accessible to everyone. Private videos require Cookie (`auth_token`) or `Authorization: Bearer` header, and will return `401 Unauthorized` or `403 Forbidden` if unauthorized.
 
 ## GET /video/d/{id}
 
-Downloads the video file with `Content-Disposition: attachment`. Public endpoint. Serves transcoded file if available.
+Downloads the video file with `Content-Disposition: attachment` using the numeric database ID. Public endpoint for public videos. Serves transcoded file if available.
+* **Access rules**: Same as `GET /video/{id}`.
+
+## GET /video/info/{short_id}
+
+Returns a single video's metadata using the 8-character `short_id`. Public endpoint for public videos. (Convenient for watch/detail pages when numeric ID is not known).
+* **Access rules**: Same as `GET /video/{id}`.
+
+## GET /video/download/{short_id}
+
+Downloads the video file with `Content-Disposition: attachment` using the 8-character `short_id`. Public endpoint for public videos. Serves transcoded file if available.
+* **Access rules**: Same as `GET /video/{id}`.
 
 ## GET /video/r/{short_id}
 
@@ -168,13 +182,14 @@ Serves the **pre-generated thumbnail** (WebP) extracted from the video by FFmpeg
 
 ## PATCH /video/{id}
 
-Unified partial update endpoint. Updates any combination of **title**, **visibility**, and **pinned** status. **Requires authentication.** Owner or superuser only.
+Unified partial update endpoint. Updates any combination of **title**, **description**, **visibility**, and **pinned** status. **Requires authentication.** Owner or superuser only.
 
 Request body (all optional):
 
 ```json
 {
   "title": "New Title",
+  "description": "Updated description text",
   "visibility": "public",
   "pinned": true
 }

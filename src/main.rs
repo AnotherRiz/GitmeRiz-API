@@ -68,6 +68,12 @@ async fn main() {
         video_semaphore: Arc::new(Semaphore::new(video_permit_count)),
     });
 
+    // Resume any unfinished video processing tasks
+    let state_clone = state.clone();
+    tokio::spawn(async move {
+        handlers::video::resume_processing_on_startup(state_clone).await;
+    });
+
     // Protected routes - require authentication
     let protected_routes = Router::new()
         .merge(users::protected_routes())
