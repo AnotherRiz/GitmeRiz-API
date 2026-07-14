@@ -34,11 +34,13 @@
 | GET | `/video/me/pinned` | Yes | List current user's pinned videos (no pagination, max 4) |
 | POST | `/video` | Yes | Upload video(s) (multipart, no size limit, up to 5 files); returns `202`, processes in background via FFmpeg |
 | POST | `/video/status` | Yes | Check processing status of up to 100 video ids (own only) |
-| GET | `/video/{id}` | No | Get video metadata by numeric id (public) |
-| GET | `/video/d/{id}` | No | Download video file with attachment header (serves transcoded if available) |
+| GET | `/video/{id}` | Optional | Get video metadata by numeric id (public: no auth, private: cookie/header) |
+| GET | `/video/d/{id}` | Optional | Download video file with attachment header by numeric id (public: no auth, private: cookie/header) |
+| GET | `/video/info/{short_id}` | Optional | Get video metadata by short_id (public: no auth, private: cookie/header) |
+| GET | `/video/download/{short_id}` | Optional | Download video file with attachment header by short_id (public: no auth, private: cookie/header) |
 | GET | `/video/r/{short_id}` | Optional | Stream video inline with HTTP 206 Range support (public: no auth, private: cookie/header) |
 | GET | `/video/t/{short_id}` | Optional | Serve pre-generated thumbnail (WebP, cached 1 year) |
-| PATCH | `/video/{id}` | Yes | Unified partial update: title/visibility/pinned (owner / superuser) |
+| PATCH | `/video/{id}` | Yes | Unified partial update: title/description/visibility/pinned (owner / superuser) |
 | PATCH | `/video/reorder-pins` | Yes | Persist custom order for pinned videos (max 4, owner / superuser) |
 | POST | `/video/{id}/reprocess` | Yes | Retry FFmpeg thumbnail + transcoding - returns `202`, processes in background (owner / superuser) |
 | DELETE | `/video/{id}` | Yes | Delete video + all files (original, transcoded, thumbnail) (owner / superuser) |

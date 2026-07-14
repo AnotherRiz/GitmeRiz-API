@@ -262,6 +262,20 @@ impl Database {
                 .await?;
         }
 
+        // Add description column to videos
+        let has_video_description = matches!(
+            sqlx::query("SHOW COLUMNS FROM videos LIKE 'description'")
+                .fetch_optional(&self.pool)
+                .await,
+            Ok(Some(_))
+        );
+        if !has_video_description {
+            tracing::info!("Adding description column to videos table");
+            sqlx::query("ALTER TABLE videos ADD COLUMN description TEXT")
+                .execute(&self.pool)
+                .await?;
+        }
+
         // Add short_id column to videos (with backfill)
         let has_video_short_id = matches!(
             sqlx::query("SHOW COLUMNS FROM videos LIKE 'short_id'")
@@ -378,6 +392,20 @@ impl Database {
             )
             .execute(&self.pool)
             .await?;
+        }
+
+        // Add processing_progress column to videos
+        let has_video_progress = matches!(
+            sqlx::query("SHOW COLUMNS FROM videos LIKE 'processing_progress'")
+                .fetch_optional(&self.pool)
+                .await,
+            Ok(Some(_))
+        );
+        if !has_video_progress {
+            tracing::info!("Adding processing_progress column to videos table");
+            sqlx::query("ALTER TABLE videos ADD COLUMN processing_progress INT NOT NULL DEFAULT 0")
+                .execute(&self.pool)
+                .await?;
         }
 
         // Create audio table with file storage columns
