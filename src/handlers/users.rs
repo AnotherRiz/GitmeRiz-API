@@ -24,6 +24,7 @@ pub fn public_routes() -> Router<Arc<AppState>> {
         .route("/login", post(login))
         .route("/logout", post(logout))
         .route("/refresh", post(refresh))
+        .route("/validate-session", get(validate_session))
 }
 
 // Protected routes (authentication required) - middleware applied in main.rs
@@ -402,6 +403,54 @@ async fn refresh(
     };
 
     (StatusCode::OK, Json(ApiResponse::success(response)))
+}
+
+// GET /validate-session
+// Public. Checks whether the refresh_token cookie maps to a valid (non-revoked,
+// non-expired) session, and returns the user info. Does NOT rotate tokens.
+async fn validate_session(
+    State(state): State<Arc<AppState>>,
+    cookies: Cookies,
+) -> (StatusCode, Json<ApiResponse<UserResponse>>) {
+    // 1. Read refresh_token from cookie
+    let refresh_token = match cookies.get("refresh_token").map(|c| c.value().to_string()) {
+        Some(t) => t,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(ApiResponse::error("No active session")),
+            );
+        }
+    };
+
+    // 2. Look up a valid session and join the user row (read-only)
+    let user: Result<Option<User>, _> = sqlx::query_as(
+        "SELECT u.id, u.name, u.username, u.email, u.password_hash, u.role \
+         FROM sessions s \
+         JOIN users u ON s.user_id = u.id \
+         WHERE s.refresh_token = SHA2(?, 256) \
+           AND s.is_revoked = FALSE \
+           AND s.expires_at > NOW()",
+    )
+    .bind(&refresh_token)
+    .fetch_optional(&state.db.pool)
+    .await;
+
+    // 3. Return user info or 401
+    match user {
+        Ok(Some(u)) => (StatusCode::OK, Json(ApiResponse::success(u.into()))),
+        Ok(None) => (
+            StatusCode::UNAUTHORIZED,
+            Json(ApiResponse::error("Invalid or expired session")),
+        ),
+        Err(e) => {
+            tracing::error!("Database error in validate_session: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::error("Internal database error")),
+            )
+        }
+    }
 }
 
 // GET /api/users/me - Get current authenticated user

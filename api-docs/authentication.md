@@ -163,3 +163,31 @@ Errors:
 ```bash
 curl -X POST http://localhost:3000/refresh
 ```
+
+## GET /validate-session
+
+Public. Checks whether the `refresh_token` HttpOnly cookie corresponds to a valid
+(non-revoked, non-expired) session and returns the user info. Unlike `POST /refresh`,
+this endpoint is read-only: it does **not** issue a new access token or rotate the
+refresh token. Intended for the frontend to restore a session on app startup.
+
+Response `200`:
+```json
+{
+  "success": true,
+  "data": {
+    "id": 1,
+    "name": "John Doe",
+    "username": "john",
+    "email": "john@example.com",
+    "role": "user"
+  }
+}
+```
+
+Errors:
+- `401` — missing `refresh_token` cookie, or the session is invalid/revoked/expired.
+
+```bash
+curl -b cookies.txt http://localhost:3000/validate-session
+```

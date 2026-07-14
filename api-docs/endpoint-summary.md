@@ -9,6 +9,7 @@
 | POST | `/login` | No | Login, sets `auth_token` & `refresh_token` cookies + returns tokens |
 | POST | `/logout` | No | Clears `auth_token` & `refresh_token` cookies, revokes session in DB |
 | POST | `/refresh` | No | Rotates Access Token and Refresh Token using `refresh_token` cookie |
+| GET | `/validate-session` | No | Check if the current `refresh_token` cookie is a valid session; returns user info without rotating tokens |
 | GET | `/users/me` | Yes | Current user |
 | GET | `/users` | Yes | List users with pagination (superuser) - supports `?page=1&limit=20` |
 | GET | `/users/{id}` | Yes | Get user (self or superuser) |
