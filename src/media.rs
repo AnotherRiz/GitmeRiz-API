@@ -281,6 +281,37 @@ pub fn generate_thumbnail_and_preview(image_data: &[u8]) -> Result<(Vec<u8>, Vec
     Ok((thumb_encoded.to_vec(), preview_encoded.to_vec()))
 }
 
+/// Generate a single thumbnail (WebP, max 500px width, quality 80) from image bytes.
+/// Used for audio cover art, where only a thumbnail is needed (no preview).
+pub fn generate_thumbnail_only(image_data: &[u8]) -> Result<Vec<u8>, String> {
+    use image::{GenericImageView, ImageReader};
+    use std::io::Cursor;
+
+    let img = ImageReader::new(Cursor::new(image_data))
+        .with_guessed_format()
+        .map_err(|e| format!("Failed to detect image format: {}", e))?
+        .decode()
+        .map_err(|e| format!("Failed to decode image: {}", e))?;
+
+    let (orig_width, orig_height) = img.dimensions();
+
+    // Resize to 500px max width, never upscale
+    let thumb_img = if orig_width > 500 {
+        let ratio = 500.0 / orig_width as f32;
+        let new_height = (orig_height as f32 * ratio) as u32;
+        img.resize(500, new_height, image::imageops::FilterType::Lanczos3)
+    } else {
+        img
+    };
+
+    let thumb_rgba = thumb_img.to_rgba8();
+    let (thumb_width, thumb_height) = (thumb_rgba.width(), thumb_rgba.height());
+    let thumb_encoder = webp::Encoder::from_rgba(&thumb_rgba, thumb_width, thumb_height);
+    let thumb_encoded = thumb_encoder.encode(80.0);
+
+    Ok(thumb_encoded.to_vec())
+}
+
 /// Generate transcoded video path from original stored path
 /// Converts: video/2026/07/2026-07-01/2026-07-01_15-15-01_UUID.mkv
 /// To:       video/2026/07/2026-07-01/2026-07-01_15-15-01_UUID-web.mp4

@@ -45,11 +45,13 @@
 | PATCH | `/video/reorder-pins` | Yes | Persist custom order for pinned videos (max 4, owner / superuser) |
 | POST | `/video/{id}/reprocess` | Yes | Retry FFmpeg thumbnail + transcoding - returns `202`, processes in background (owner / superuser) |
 | DELETE | `/video/{id}` | Yes | Delete video + all files (original, transcoded, thumbnail) (owner / superuser) |
+| GET | `/audio/public` | No | List all public audio items |
 | GET | `/audio` | Yes | List audio (own / all for superuser) |
-| POST | `/audio` | Yes | Upload audio (multipart, no size limit) |
-| GET | `/audio/{id}` | Yes | Get audio metadata (owner / superuser) |
-| GET | `/audio/{id}/download` | Yes | Download audio file (owner / superuser) |
-| DELETE | `/audio/{id}` | Yes | Delete audio + file (owner / superuser) |
+| POST | `/audio` | Yes | Upload audio (multipart, no size limit); supports title/description/visibility/thumbnail (all optional except file); `.aac` auto-remuxed to `.m4a` |
+| GET | `/audio/{id}` | Optional | Get audio metadata by id (public: no auth, private: cookie/header) |
+| GET | `/audio/{id}/download` | Optional | Download audio file with attachment header (public: no auth, private: cookie/header) |
+| GET | `/audio/{id}/thumbnail` | Optional | Serve cover art thumbnail inline, WebP cached 1 year (public: no auth, private: cookie/header) |
+| DELETE | `/audio/{id}` | Yes | Delete audio + file + thumbnail (owner / superuser) |
 | GET | `/blog` | Yes | List published posts |
 | POST | `/blog` | Yes | Create post (admin / superuser) |
 | GET | `/blog/{id}` | Yes | Get post |

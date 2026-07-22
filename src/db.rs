@@ -428,6 +428,50 @@ impl Database {
         .execute(&self.pool)
         .await?;
 
+        // --- Audio table column migrations (idempotent) ---
+
+        // Add description column to audio
+        let has_audio_description = matches!(
+            sqlx::query("SHOW COLUMNS FROM audio LIKE 'description'")
+                .fetch_optional(&self.pool)
+                .await,
+            Ok(Some(_))
+        );
+        if !has_audio_description {
+            tracing::info!("Adding description column to audio table");
+            sqlx::query("ALTER TABLE audio ADD COLUMN description TEXT")
+                .execute(&self.pool)
+                .await?;
+        }
+
+        // Add visibility column to audio
+        let has_audio_visibility = matches!(
+            sqlx::query("SHOW COLUMNS FROM audio LIKE 'visibility'")
+                .fetch_optional(&self.pool)
+                .await,
+            Ok(Some(_))
+        );
+        if !has_audio_visibility {
+            tracing::info!("Adding visibility column to audio table");
+            sqlx::query("ALTER TABLE audio ADD COLUMN visibility ENUM('public', 'private') NOT NULL DEFAULT 'private'")
+                .execute(&self.pool)
+                .await?;
+        }
+
+        // Add thumbnail_path column to audio (optional cover art)
+        let has_audio_thumbnail = matches!(
+            sqlx::query("SHOW COLUMNS FROM audio LIKE 'thumbnail_path'")
+                .fetch_optional(&self.pool)
+                .await,
+            Ok(Some(_))
+        );
+        if !has_audio_thumbnail {
+            tracing::info!("Adding thumbnail_path column to audio table");
+            sqlx::query("ALTER TABLE audio ADD COLUMN thumbnail_path VARCHAR(512)")
+                .execute(&self.pool)
+                .await?;
+        }
+
         // Create blog_posts table
         sqlx::query(
             r#"
