@@ -126,6 +126,9 @@ details, error cases, and examples.
 - `GET /gallery/{id}` — Get image metadata
 - `GET /gallery/d/{id}` — Download image file
 - `GET /gallery/r|t|p/{short_id}` — Serve raw / thumbnail / preview image (public, or private via signed URL)
+- `GET /audio/public` — List all public audio
+- `GET /audio/{id}` — Get audio metadata (public audio, or private with auth)
+- `GET /audio/{id}/download` — Download audio file (public audio, or private with auth)
 
 ### Protected (Auth Required)
 Authenticated via the `auth_token` cookie (preferred) or an `Authorization: Bearer <token>` header.
@@ -135,7 +138,7 @@ Authenticated via the `auth_token` cookie (preferred) or an `Authorization: Bear
   `GET /gallery/me/pinned`, `POST /gallery/status`, `PATCH /gallery/{id}/title|visibility|pinned`,
   `PATCH /gallery/reorder-pins`, `POST /gallery/{id}/reprocess`, `POST /gallery/{short_id}/sign`, `DELETE /gallery/{id}`
 - **Video** — `GET /video`, `POST /video`, `GET /video/{id}`, `GET /video/{id}/download`, `DELETE /video/{id}`
-- **Audio** — `GET /audio`, `POST /audio`, `GET /audio/{id}`, `GET /audio/{id}/download`, `DELETE /audio/{id}`
+- **Audio** — `GET /audio`, `POST /audio`, `DELETE /audio/{id}`
 - **Blog** — `GET /blog`, `POST /blog` (admin/superuser), `GET /blog/{id}`, `PUT|DELETE /blog/{id}` (admin/superuser)
 - **Notes** — `GET|POST /notes`, `GET|PUT|DELETE /notes/{id}`
 - **Clipboard** — `GET|POST /clipboard`, `GET|PUT|DELETE /clipboard/{id}`
