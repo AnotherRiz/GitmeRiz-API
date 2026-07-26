@@ -51,6 +51,12 @@
 | GET | `/audio/{id}` | Optional | Get audio metadata by id (public: no auth, private: cookie/header) |
 | GET | `/audio/{id}/download` | Optional | Download audio file with attachment header (public: no auth, private: cookie/header) |
 | GET | `/audio/{id}/thumbnail` | Optional | Serve cover art thumbnail inline, WebP cached 1 year (public: no auth, private: cookie/header) |
+| PATCH | `/audio/{id}` | Yes | Unified partial update: title/description/visibility/pinned (owner / superuser, max 8 pinned per user) |
+| GET | `/audio/me/pinned` | Yes | List current user's pinned audio (no pagination, max 8) |
+| PATCH | `/audio/reorder-pins` | Yes | Persist custom order for pinned audio (drag-and-drop support, max 8) |
+| GET | `/audio/info/{short_id}` | Optional | Get audio metadata by short_id (public: no auth, private: cookie/header) |
+| GET | `/audio/download/{short_id}` | Optional | Download audio file by short_id with attachment header (public: no auth, private: cookie/header) |
+| GET | `/audio/thumb/{short_id}` | Optional | Serve cover art thumbnail by short_id inline, WebP cached 1 year (public: no auth, private: cookie/header) |
 | DELETE | `/audio/{id}` | Yes | Delete audio + file + thumbnail (owner / superuser) |
 | GET | `/blog` | Yes | List published posts |
 | POST | `/blog` | Yes | Create post (admin / superuser) |

@@ -3,10 +3,10 @@ use axum::{
     extract::{Multipart, Path, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::{get, delete},
+    routing::{get, delete, patch},
     Extension, Json, Router,
 };
-use serde::Serialize;
+use serde::{Serialize, Deserialize};
 use sqlx::FromRow;
 use std::sync::Arc;
 use tower_cookies::Cookies;
@@ -15,7 +15,7 @@ use crate::auth::validate_token;
 use crate::error_page::build_error_response;
 use crate::media::{
     delete_file, generate_storage_path, generate_thumbnail_only, generate_thumbnail_path,
-    read_file, save_file, validate_extension, MediaType,
+    read_file, save_file, validate_extension, generate_short_id, MediaType,
 };
 use crate::models::{ApiResponse, AuthUser};
 use crate::AppState;
@@ -23,7 +23,7 @@ use crate::AppState;
 // ─── Constants ─────────────────────────────────────────────────────────────────
 
 /// Column list used in all SELECT queries (keep in sync with AudioItem struct)
-const AUDIO_COLUMNS: &str = "id, user_id, title, description, original_filename, stored_path, size_bytes, mime_type, visibility, thumbnail_path";
+const AUDIO_COLUMNS: &str = "id, user_id, title, description, original_filename, stored_path, size_bytes, mime_type, visibility, thumbnail_path, pinned, pin_order, short_id";
 
 /// Allowed extensions for the optional audio cover art thumbnail
 const ALLOWED_THUMBNAIL_EXTENSIONS: &[&str] = &[".jpg", ".jpeg", ".png", ".webp", ".gif"];
@@ -44,6 +44,22 @@ pub struct AudioItem {
     pub visibility: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thumbnail_path: Option<String>,
+    pub pinned: bool,
+    pub pin_order: i32,
+    pub short_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateAudioRequest {
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub visibility: Option<String>,
+    pub pinned: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ReorderAudioPinsRequest {
+    pub ordered_ids: Vec<i32>,
 }
 
 // ─── Routes ────────────────────────────────────────────────────────────────────
@@ -52,6 +68,9 @@ pub struct AudioItem {
 pub fn public_routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/audio/public", get(list_public_audio))
+        .route("/audio/info/{short_id}", get(get_audio_by_short_id))
+        .route("/audio/download/{short_id}", get(download_audio_by_short_id))
+        .route("/audio/thumb/{short_id}", get(serve_audio_thumbnail_by_short_id))
         .route("/audio/{id}", get(get_audio))
         .route("/audio/{id}/download", get(download_audio))
         .route("/audio/{id}/thumbnail", get(serve_audio_thumbnail))
@@ -61,7 +80,9 @@ pub fn public_routes() -> Router<Arc<AppState>> {
 pub fn protected_routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/audio", get(list_audio).post(upload_audio))
-        .route("/audio/{id}", delete(delete_audio))
+        .route("/audio/{id}", patch(update_audio).delete(delete_audio))
+        .route("/audio/me/pinned", get(list_pinned_audio))
+        .route("/audio/reorder-pins", patch(reorder_audio_pins))
 }
 
 // ─── Helpers ───────────────────────────────────────────────────────────────────
@@ -324,6 +345,27 @@ async fn upload_audio(
     // Get MIME type from final stored extension
     let mime_type = MediaType::Audio.mime_type_for_extension(&target_extension);
 
+    // Generate short_id with collision retry
+    let short_id = loop {
+        let candidate = generate_short_id();
+        let exists: Result<Option<(i32,)>, _> =
+            sqlx::query_as("SELECT id FROM audio WHERE short_id = ?")
+                .bind(&candidate)
+                .fetch_optional(&state.db.pool)
+                .await;
+        match exists {
+            Ok(None) => break candidate,
+            Ok(Some(_)) => continue,
+            Err(e) => {
+                tracing::error!("Failed to check short_id collision: {}", e);
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ApiResponse::error("Failed to generate unique short_id")),
+                );
+            }
+        }
+    };
+
     // Process optional thumbnail (cover art). Failure here is non-fatal — the audio
     // upload still succeeds, just without a thumbnail.
     let mut thumbnail_path: Option<String> = None;
@@ -377,7 +419,7 @@ async fn upload_audio(
 
     // Insert into database
     let result = sqlx::query(
-        "INSERT INTO audio (user_id, title, description, original_filename, stored_path, size_bytes, mime_type, visibility, thumbnail_path) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO audio (user_id, title, description, original_filename, stored_path, size_bytes, mime_type, visibility, thumbnail_path, pinned, pin_order, short_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(auth_user.id)
     .bind(&title)
@@ -388,6 +430,9 @@ async fn upload_audio(
     .bind(mime_type)
     .bind(&visibility)
     .bind(&thumbnail_path)
+    .bind(false)  // pinned
+    .bind(0)      // pin_order
+    .bind(&short_id)
     .execute(&state.db.pool)
     .await;
 
@@ -404,6 +449,9 @@ async fn upload_audio(
                 mime_type: mime_type.to_string(),
                 visibility,
                 thumbnail_path,
+                pinned: false,
+                pin_order: 0,
+                short_id,
             };
             (StatusCode::CREATED, Json(ApiResponse::success(item)))
         }
@@ -558,6 +606,495 @@ async fn serve_audio_thumbnail(
         AUDIO_COLUMNS
     ))
     .bind(id)
+    .fetch_one(&state.db.pool)
+    .await;
+
+    let item = match item {
+        Ok(item) => item,
+        Err(_) => {
+            return build_error_response(
+                StatusCode::NOT_FOUND,
+                "Audio not found",
+                &headers,
+                &state.config.frontend_url,
+            );
+        }
+    };
+
+    // Access control for private audio
+    if item.visibility == "private" {
+        let auth_user = extract_optional_auth(&cookies, &headers, &state.config.jwt_secret);
+        match auth_user {
+            Some(user) => {
+                if item.user_id != user.id && !user.is_superuser() {
+                    return build_error_response(
+                        StatusCode::FORBIDDEN,
+                        "You can only access your own private audio",
+                        &headers,
+                        &state.config.frontend_url,
+                    );
+                }
+            }
+            None => {
+                return build_error_response(
+                    StatusCode::UNAUTHORIZED,
+                    "This audio is private. Authentication required.",
+                    &headers,
+                    &state.config.frontend_url,
+                );
+            }
+        }
+    }
+
+    let thumb_path = match &item.thumbnail_path {
+        Some(p) => p,
+        None => {
+            return build_error_response(
+                StatusCode::NOT_FOUND,
+                "This audio has no thumbnail",
+                &headers,
+                &state.config.frontend_url,
+            );
+        }
+    };
+
+    match read_file(&state.config.storage_dir, thumb_path).await {
+        Ok(data) => Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "image/webp")
+            .header(header::CACHE_CONTROL, "public, max-age=31536000") // 1 year
+            .body(Body::from(data))
+            .unwrap()
+            .into_response(),
+        Err(_) => build_error_response(
+            StatusCode::NOT_FOUND,
+            "Thumbnail not found on disk",
+            &headers,
+            &state.config.frontend_url,
+        ),
+    }
+}
+
+// PATCH /api/audio/:id - Update audio (owner or superuser) - supports partial updates of title, description, visibility, and pinned
+async fn update_audio(
+    Extension(auth_user): Extension<AuthUser>,
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i32>,
+    Json(payload): Json<UpdateAudioRequest>,
+) -> (StatusCode, Json<ApiResponse<AudioItem>>) {
+    const MAX_PINNED_AUDIO: i64 = 8;
+
+    // Reject if all fields are None
+    if payload.title.is_none()
+        && payload.description.is_none()
+        && payload.visibility.is_none()
+        && payload.pinned.is_none()
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::error("At least one field must be provided")),
+        );
+    }
+
+    // Fetch current item
+    let mut item: AudioItem = match sqlx::query_as(&format!(
+        "SELECT {} FROM audio WHERE id = ?",
+        AUDIO_COLUMNS
+    ))
+    .bind(id)
+    .fetch_one(&state.db.pool)
+    .await
+    {
+        Ok(item) => item,
+        Err(_) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ApiResponse::error("Audio not found")),
+            );
+        }
+    };
+
+    // Ownership check
+    if item.user_id != auth_user.id && !auth_user.is_superuser() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(ApiResponse::error("You can only update your own audio")),
+        );
+    }
+
+    // Apply title update
+    if let Some(new_title) = payload.title {
+        let trimmed = new_title.trim();
+        if trimmed.is_empty() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiResponse::error("Title cannot be empty")),
+            );
+        }
+        item.title = trimmed.to_string();
+    }
+
+    // Apply description update
+    if let Some(new_description) = payload.description {
+        let trimmed = new_description.trim();
+        item.description = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        };
+    }
+
+    // Apply visibility update
+    if let Some(new_visibility) = payload.visibility {
+        let trimmed_lower = new_visibility.trim().to_lowercase();
+        if trimmed_lower == "public" || trimmed_lower == "private" {
+            item.visibility = trimmed_lower;
+        } else {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiResponse::error(
+                    "Visibility must be 'public' or 'private'",
+                )),
+            );
+        }
+    }
+
+    // Apply pinned update
+    if let Some(should_pin) = payload.pinned {
+        if should_pin && !item.pinned {
+            // Pinning: check limit and assign pin_order
+            let pinned_count: Result<(i64,), _> =
+                sqlx::query_as("SELECT COUNT(*) FROM audio WHERE user_id = ? AND pinned = TRUE")
+                    .bind(auth_user.id)
+                    .fetch_one(&state.db.pool)
+                    .await;
+
+            match pinned_count {
+                Ok((count,)) if count >= MAX_PINNED_AUDIO => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(ApiResponse::error("You can only pin up to 8 audio items")),
+                    );
+                }
+                Ok(_) => {
+                    // Get max pin_order and increment
+                    let max_order: Result<(Option<i32>,), _> =
+                        sqlx::query_as("SELECT MAX(pin_order) FROM audio WHERE user_id = ? AND pinned = TRUE")
+                            .bind(auth_user.id)
+                            .fetch_one(&state.db.pool)
+                            .await;
+
+                    let new_order = match max_order {
+                        Ok((Some(max_val),)) => max_val + 1,
+                        _ => 1,
+                    };
+                    item.pin_order = new_order;
+                    item.pinned = true;
+                }
+                Err(_) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ApiResponse::error("Failed to check pin limit")),
+                    );
+                }
+            }
+        } else if !should_pin && item.pinned {
+            // Unpinning: reset pin_order
+            item.pinned = false;
+            item.pin_order = 0;
+        }
+        // If requested value equals current value, no change
+    }
+
+    // Update database
+    let result = sqlx::query(
+        "UPDATE audio SET title = ?, description = ?, visibility = ?, pinned = ?, pin_order = ? WHERE id = ?",
+    )
+    .bind(&item.title)
+    .bind(&item.description)
+    .bind(&item.visibility)
+    .bind(item.pinned)
+    .bind(item.pin_order)
+    .bind(id)
+    .execute(&state.db.pool)
+    .await;
+
+    match result {
+        Ok(_) => (StatusCode::OK, Json(ApiResponse::success(item))),
+        Err(e) => {
+            tracing::error!("Failed to update audio: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::error("Failed to update audio")),
+            )
+        }
+    }
+}
+
+// GET /api/audio/me/pinned - List current user's pinned audio (protected route)
+async fn list_pinned_audio(
+    Extension(auth_user): Extension<AuthUser>,
+    State(state): State<Arc<AppState>>,
+) -> (StatusCode, Json<ApiResponse<Vec<AudioItem>>>) {
+    let items: Result<Vec<AudioItem>, _> = sqlx::query_as(&format!(
+        "SELECT {} FROM audio WHERE user_id = ? AND pinned = TRUE ORDER BY pin_order ASC, updated_at DESC",
+        AUDIO_COLUMNS
+    ))
+    .bind(auth_user.id)
+    .fetch_all(&state.db.pool)
+    .await;
+
+    match items {
+        Ok(items) => (StatusCode::OK, Json(ApiResponse::success(items))),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse::error("Failed to fetch pinned audio")),
+        ),
+    }
+}
+
+// PATCH /api/audio/reorder-pins - Reorder pinned audio items (protected route)
+async fn reorder_audio_pins(
+    Extension(auth_user): Extension<AuthUser>,
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<ReorderAudioPinsRequest>,
+) -> (StatusCode, Json<ApiResponse<String>>) {
+    const MAX_PINNED_AUDIO: usize = 8;
+
+    // Validate ordered_ids
+    if payload.ordered_ids.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::error("ordered_ids cannot be empty")),
+        );
+    }
+
+    if payload.ordered_ids.len() > MAX_PINNED_AUDIO {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::error("Cannot reorder more than 8 pinned audio items")),
+        );
+    }
+
+    // Start transaction
+    let mut tx = match state.db.pool.begin().await {
+        Ok(tx) => tx,
+        Err(e) => {
+            tracing::error!("Failed to start transaction: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::error("Failed to reorder pins")),
+            );
+        }
+    };
+
+    // Validate each item
+    for (idx, id) in payload.ordered_ids.iter().enumerate() {
+        let item: Result<(i32, bool), _> =
+            sqlx::query_as("SELECT user_id, pinned FROM audio WHERE id = ?")
+                .bind(id)
+                .fetch_one(&mut *tx)
+                .await;
+
+        match item {
+            Ok((user_id, pinned)) => {
+                // Check ownership
+                if user_id != auth_user.id && !auth_user.is_superuser() {
+                    let _ = tx.rollback().await;
+                    return (
+                        StatusCode::FORBIDDEN,
+                        Json(ApiResponse::error("You can only reorder your own audio")),
+                    );
+                }
+                // Check pinned status
+                if !pinned {
+                    let _ = tx.rollback().await;
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(ApiResponse::error(
+                            "All items must be pinned to reorder",
+                        )),
+                    );
+                }
+            }
+            Err(_) => {
+                let _ = tx.rollback().await;
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(ApiResponse::error("Audio item not found")),
+                );
+            }
+        }
+
+        // Update pin_order (1-based)
+        let pin_order = (idx + 1) as i32;
+        if let Err(e) = sqlx::query("UPDATE audio SET pin_order = ? WHERE id = ?")
+            .bind(pin_order)
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+        {
+            tracing::error!("Failed to update pin_order: {}", e);
+            let _ = tx.rollback().await;
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::error("Failed to reorder pins")),
+            );
+        }
+    }
+
+    // Commit transaction
+    if let Err(e) = tx.commit().await {
+        tracing::error!("Failed to commit transaction: {}", e);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse::error("Failed to reorder pins")),
+        );
+    }
+
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success("Pins reordered successfully".to_string())),
+    )
+}
+
+// GET /api/audio/info/:short_id - Get audio metadata by short_id (public with visibility check)
+async fn get_audio_by_short_id(
+    State(state): State<Arc<AppState>>,
+    cookies: Cookies,
+    headers: HeaderMap,
+    Path(short_id): Path<String>,
+) -> impl IntoResponse {
+    let item: Result<AudioItem, _> = sqlx::query_as(&format!(
+        "SELECT {} FROM audio WHERE short_id = ?",
+        AUDIO_COLUMNS
+    ))
+    .bind(&short_id)
+    .fetch_one(&state.db.pool)
+    .await;
+
+    match item {
+        Ok(item) => {
+            // Access control for private audio
+            if item.visibility == "private" {
+                let auth_user = extract_optional_auth(&cookies, &headers, &state.config.jwt_secret);
+                match auth_user {
+                    Some(user) => {
+                        if item.user_id != user.id && !user.is_superuser() {
+                            return build_error_response(
+                                StatusCode::FORBIDDEN,
+                                "You can only access your own private audio",
+                                &headers,
+                                &state.config.frontend_url,
+                            );
+                        }
+                    }
+                    None => {
+                        return build_error_response(
+                            StatusCode::UNAUTHORIZED,
+                            "This audio is private. Authentication required.",
+                            &headers,
+                            &state.config.frontend_url,
+                        );
+                    }
+                }
+            }
+            (StatusCode::OK, Json(ApiResponse::success(item))).into_response()
+        }
+        Err(_) => build_error_response(
+            StatusCode::NOT_FOUND,
+            "Audio not found",
+            &headers,
+            &state.config.frontend_url,
+        ),
+    }
+}
+
+// GET /api/audio/download/:short_id - Download audio file by short_id (public with visibility check)
+async fn download_audio_by_short_id(
+    State(state): State<Arc<AppState>>,
+    cookies: Cookies,
+    headers: HeaderMap,
+    Path(short_id): Path<String>,
+) -> impl IntoResponse {
+    let item: Result<AudioItem, _> = sqlx::query_as(&format!(
+        "SELECT {} FROM audio WHERE short_id = ?",
+        AUDIO_COLUMNS
+    ))
+    .bind(&short_id)
+    .fetch_one(&state.db.pool)
+    .await;
+
+    match item {
+        Ok(item) => {
+            // Access control for private audio
+            if item.visibility == "private" {
+                let auth_user = extract_optional_auth(&cookies, &headers, &state.config.jwt_secret);
+                match auth_user {
+                    Some(user) => {
+                        if item.user_id != user.id && !user.is_superuser() {
+                            return build_error_response(
+                                StatusCode::FORBIDDEN,
+                                "You can only access your own private audio",
+                                &headers,
+                                &state.config.frontend_url,
+                            );
+                        }
+                    }
+                    None => {
+                        return build_error_response(
+                            StatusCode::UNAUTHORIZED,
+                            "This audio is private. Authentication required.",
+                            &headers,
+                            &state.config.frontend_url,
+                        );
+                    }
+                }
+            }
+
+            match read_file(&state.config.storage_dir, &item.stored_path).await {
+                Ok(data) => {
+                    let body = Body::from(data);
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, item.mime_type)
+                        .header(
+                            header::CONTENT_DISPOSITION,
+                            format!("attachment; filename=\"{}\"", item.original_filename),
+                        )
+                        .body(body)
+                        .unwrap()
+                        .into_response()
+                }
+                Err(_) => build_error_response(
+                    StatusCode::NOT_FOUND,
+                    "File not found on disk",
+                    &headers,
+                    &state.config.frontend_url,
+                ),
+            }
+        }
+        Err(_) => build_error_response(
+            StatusCode::NOT_FOUND,
+            "Audio not found",
+            &headers,
+            &state.config.frontend_url,
+        ),
+    }
+}
+
+// GET /api/audio/thumb/:short_id - Serve audio cover art thumbnail by short_id (public with visibility check)
+async fn serve_audio_thumbnail_by_short_id(
+    State(state): State<Arc<AppState>>,
+    cookies: Cookies,
+    headers: HeaderMap,
+    Path(short_id): Path<String>,
+) -> impl IntoResponse {
+    let item: Result<AudioItem, _> = sqlx::query_as(&format!(
+        "SELECT {} FROM audio WHERE short_id = ?",
+        AUDIO_COLUMNS
+    ))
+    .bind(&short_id)
     .fetch_one(&state.db.pool)
     .await;
 
