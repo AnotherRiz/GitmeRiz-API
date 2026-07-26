@@ -214,7 +214,241 @@ curl -o song.mp3 http://localhost:3000/api/audio/1/download
 # Download a private audio file (with auth)
 curl -o song.mp3 \
   -H "Authorization: Bearer <token>" \
-  http://localhost:3000/api/audio/2/download
+
+## PATCH /audio/{id}
+
+Updates audio metadata (title, description, visibility, or pinned status). Supports partial updates;
+at least one field must be provided. Owner or `superuser` only. Requires authentication.
+
+**Request body** (all fields optional, at least one required):
+```json
+{
+  "title": "New Title (optional)",
+  "description": "New description (optional; empty string clears it)",
+  "visibility": "public or private (optional)",
+  "pinned": true or false (optional)
+}
+```
+
+**Pinning constraints:**
+- Maximum **8 pinned audio items per user**.
+- When pinning: assigns `pin_order = MAX(pin_order) + 1` for the current user.
+- When unpinning: resets `pin_order = 0`.
+- Pinning the 9th item returns `400 Bad Request`.
+
+Response `200`:
+```json
+{
+  "success": true,
+  "data": {
+    "id": 1,
+    "user_id": 1,
+    "title": "New Title",
+    "description": "New description",
+    "original_filename": "song.mp3",
+    "stored_path": "audio/2026/07/2026-07-22/2026-07-22_14-26-40_3fa85f64-5717-4562-b3fc-2c963f66afa6.mp3",
+    "size_bytes": 5242880,
+    "mime_type": "audio/mpeg",
+    "visibility": "public",
+    "thumbnail_path": null,
+    "pinned": true,
+    "pin_order": 3,
+    "short_id": "AbC12XyZ"
+  }
+}
+```
+
+Errors:
+- `400` — all fields are `null`/missing, title becomes empty after trim, invalid visibility value, or attempted to pin 9th item.
+- `403` — authenticated user does not own the audio.
+- `404` — audio not found.
+
+```bash
+# Pin an audio item
+curl -X PATCH http://localhost:3000/api/audio/1 \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{"pinned": true}'
+
+# Update title and pin simultaneously
+curl -X PATCH http://localhost:3000/api/audio/1 \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{"title": "Updated Title", "pinned": true}'
+
+# Change visibility to public
+curl -X PATCH http://localhost:3000/api/audio/1 \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{"visibility": "public"}'
+```
+
+## GET /audio/me/pinned
+
+Lists the current user's pinned audio items, ordered by `pin_order` ascending, then `updated_at` descending.
+Requires authentication.
+
+Response `200`:
+```json
+{
+  "success": true,
+  "data": [
+    {
+      "id": 1,
+      "user_id": 1,
+      "title": "Favorite Song",
+      "description": null,
+      "original_filename": "song.mp3",
+      "stored_path": "audio/2026/07/2026-07-22/2026-07-22_14-26-40_3fa85f64-5717-4562-b3fc-2c963f66afa6.mp3",
+      "size_bytes": 5242880,
+      "mime_type": "audio/mpeg",
+      "visibility": "private",
+      "thumbnail_path": null,
+      "pinned": true,
+      "pin_order": 1,
+      "short_id": "AbC12XyZ"
+    },
+    {
+      "id": 2,
+      "user_id": 1,
+      "title": "Another Favorite",
+      "description": "Good recording",
+      "original_filename": "other.mp3",
+      "stored_path": "audio/2026/07/2026-07-22/2026-07-22_14-26-45_550e8400-e29b-41d4-a716-446655440000.mp3",
+      "size_bytes": 3145728,
+      "mime_type": "audio/mpeg",
+      "visibility": "public",
+      "thumbnail_path": null,
+      "pinned": true,
+      "pin_order": 2,
+      "short_id": "DeF45GhI"
+    }
+  ]
+}
+```
+
+```bash
+curl http://localhost:3000/api/audio/me/pinned \
+  -H "Authorization: Bearer <token>"
+```
+
+## PATCH /audio/reorder-pins
+
+Reorders the current user's pinned audio items via drag-and-drop. Validates that all items are
+owned, pinned, and within the 8-item limit. Transactional — all updates succeed or all fail.
+Requires authentication.
+
+**Request body:**
+```json
+{
+  "ordered_ids": [2, 1, 3, 4, 5, 6, 7, 8]
+}
+```
+
+Response `200`:
+```json
+{
+  "success": true,
+  "data": "Pins reordered successfully"
+}
+```
+
+Errors:
+- `400` — `ordered_ids` is empty or exceeds 8 items, or an item is not pinned.
+- `403` — authenticated user does not own an item (and is not `superuser`).
+- `404` — an item not found.
+- `500` — database transaction error.
+
+```bash
+curl -X PATCH http://localhost:3000/api/audio/reorder-pins \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{"ordered_ids": [3, 1, 2]}'
+```
+
+## GET /audio/info/{short_id}
+
+Returns a single audio item's metadata by `short_id` (public endpoint with visibility check).
+Same behavior as `GET /audio/{id}`, but uses the 8-character `short_id` instead of numeric `id`.
+
+**Access rules:**
+- `public` items: no authentication required.
+- `private` items: requires authentication and ownership (or `superuser`).
+
+Response `200`:
+```json
+{
+  "success": true,
+  "data": {
+    "id": 1,
+    "user_id": 1,
+    "title": "Public Song",
+    "description": null,
+    "original_filename": "song.mp3",
+    "stored_path": "audio/2026/07/2026-07-22/2026-07-22_14-26-40_3fa85f64-5717-4562-b3fc-2c963f66afa6.mp3",
+    "size_bytes": 5242880,
+    "mime_type": "audio/mpeg",
+    "visibility": "public",
+    "thumbnail_path": null,
+    "pinned": false,
+    "pin_order": 0,
+    "short_id": "AbC12XyZ"
+  }
+}
+```
+
+Errors:
+- `401` — private audio and no authentication provided.
+- `403` — private audio and authenticated user is not the owner (and not `superuser`).
+- `404` — audio not found.
+
+```bash
+curl http://localhost:3000/api/audio/info/AbC12XyZ
+```
+
+## GET /audio/download/{short_id}
+
+Downloads the actual audio file by `short_id` (public endpoint with visibility check).
+Same behavior as `GET /audio/{id}/download`, but uses the 8-character `short_id` instead of numeric `id`.
+
+**Access rules:**
+- `public` items: no authentication required.
+- `private` items: requires authentication and ownership (or `superuser`).
+
+Returns the audio file with `Content-Disposition: attachment; filename="..."` header.
+
+Errors:
+- `401` — private audio and no authentication provided.
+- `403` — private audio and authenticated user is not the owner (and not `superuser`).
+- `404` — audio not found or file missing on disk.
+
+```bash
+# Download a public audio file by short_id
+curl -o song.mp3 http://localhost:3000/api/audio/download/AbC12XyZ
+
+# Download a private audio file by short_id (with auth)
+curl -o song.mp3 \
+  -H "Authorization: Bearer <token>" \
+  http://localhost:3000/api/audio/download/DeF45GhI
+```
+
+## GET /audio/thumb/{short_id}
+
+Serves the cover art thumbnail image inline (WebP, cached 1 year) by `short_id`.
+Same behavior as `GET /audio/{id}/thumbnail`, but uses the 8-character `short_id` instead of numeric `id`.
+Public endpoint with visibility check.
+
+**Access rules:**
+- `public` items: no authentication required.
+- `private` items: requires authentication and ownership (or `superuser`).
+
+Errors:
+- `401` — private audio and no authentication provided.
+- `403` — private audio and authenticated user is not the owner (and not `superuser`).
+- `404` — audio not found, has no thumbnail, or thumbnail file missing on disk.
+
+```bash
+curl -o cover.webp http://localhost:3000/api/audio/thumb/AbC12XyZ
 ```
 
 ## DELETE /audio/{id}

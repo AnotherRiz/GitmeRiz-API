@@ -472,6 +472,80 @@ impl Database {
                 .await?;
         }
 
+        // Add pinned column to audio
+        let has_audio_pinned = matches!(
+            sqlx::query("SHOW COLUMNS FROM audio LIKE 'pinned'")
+                .fetch_optional(&self.pool)
+                .await,
+            Ok(Some(_))
+        );
+        if !has_audio_pinned {
+            tracing::info!("Adding pinned column to audio table");
+            sqlx::query("ALTER TABLE audio ADD COLUMN pinned BOOLEAN NOT NULL DEFAULT FALSE")
+                .execute(&self.pool)
+                .await?;
+        }
+
+        // Add pin_order column to audio
+        let has_audio_pin_order = matches!(
+            sqlx::query("SHOW COLUMNS FROM audio LIKE 'pin_order'")
+                .fetch_optional(&self.pool)
+                .await,
+            Ok(Some(_))
+        );
+        if !has_audio_pin_order {
+            tracing::info!("Adding pin_order column to audio table");
+            sqlx::query("ALTER TABLE audio ADD COLUMN pin_order INT NOT NULL DEFAULT 0")
+                .execute(&self.pool)
+                .await?;
+        }
+
+        // Add short_id column to audio (with backfill)
+        let has_audio_short_id = matches!(
+            sqlx::query("SHOW COLUMNS FROM audio LIKE 'short_id'")
+                .fetch_optional(&self.pool)
+                .await,
+            Ok(Some(_))
+        );
+        if !has_audio_short_id {
+            tracing::info!("Adding short_id column to audio table");
+            // Add column as nullable first
+            sqlx::query("ALTER TABLE audio ADD COLUMN short_id CHAR(8)")
+                .execute(&self.pool)
+                .await?;
+
+            // Backfill existing rows with unique short_ids
+            let existing_rows: Vec<(i32,)> = sqlx::query_as("SELECT id FROM audio WHERE short_id IS NULL")
+                .fetch_all(&self.pool)
+                .await?;
+
+            for (id,) in existing_rows {
+                loop {
+                    let short_id = crate::media::generate_short_id();
+                    let result = sqlx::query("UPDATE audio SET short_id = ? WHERE id = ?")
+                        .bind(&short_id)
+                        .bind(id)
+                        .execute(&self.pool)
+                        .await;
+
+                    if result.is_ok() {
+                        break;
+                    }
+                    // If collision, retry with new short_id
+                }
+            }
+
+            // Now make it NOT NULL and UNIQUE
+            sqlx::query("ALTER TABLE audio MODIFY COLUMN short_id CHAR(8) NOT NULL")
+                .execute(&self.pool)
+                .await?;
+            sqlx::query("ALTER TABLE audio ADD UNIQUE KEY unique_audio_short_id (short_id)")
+                .execute(&self.pool)
+                .await?;
+
+            tracing::info!("Audio short_id column added and backfilled successfully");
+        }
+
         // Create blog_posts table
         sqlx::query(
             r#"
