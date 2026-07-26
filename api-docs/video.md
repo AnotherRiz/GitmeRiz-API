@@ -53,11 +53,12 @@ and a `status`.
   "transcoded_path": "video/2026/06/.../UUID-web.mp4",
   "pinned": false,
   "status": "active",
-  "pin_order": 0
+  "pin_order": 0,
+  "created_at": "2026-06-30T14:25:10Z"
 }
 ```
 
-*Note: `transcoded_path` is present only if the original was non-web-safe. The streaming/download endpoints automatically serve the transcoded file when available.*
+*Note: `transcoded_path` is present only if the original was non-web-safe. The streaming/download endpoints automatically serve the transcoded file when available. `created_at` is an ISO 8601 timestamp in UTC.*
 
 ---
 
