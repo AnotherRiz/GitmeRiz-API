@@ -3,13 +3,14 @@ use axum::{
     extract::{Multipart, Path, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::{get, delete, patch},
+    routing::{get, patch},
     Extension, Json, Router,
 };
 use serde::{Serialize, Deserialize};
 use sqlx::FromRow;
 use std::sync::Arc;
 use tower_cookies::Cookies;
+use chrono::{DateTime, Utc};
 
 use crate::auth::validate_token;
 use crate::error_page::build_error_response;
@@ -23,7 +24,7 @@ use crate::AppState;
 // ─── Constants ─────────────────────────────────────────────────────────────────
 
 /// Column list used in all SELECT queries (keep in sync with AudioItem struct)
-const AUDIO_COLUMNS: &str = "id, user_id, title, description, original_filename, stored_path, size_bytes, mime_type, visibility, thumbnail_path, pinned, pin_order, short_id";
+const AUDIO_COLUMNS: &str = "id, user_id, title, description, original_filename, stored_path, size_bytes, mime_type, visibility, thumbnail_path, pinned, pin_order, short_id, created_at";
 
 /// Allowed extensions for the optional audio cover art thumbnail
 const ALLOWED_THUMBNAIL_EXTENSIONS: &[&str] = &[".jpg", ".jpeg", ".png", ".webp", ".gif"];
@@ -47,6 +48,7 @@ pub struct AudioItem {
     pub pinned: bool,
     pub pin_order: i32,
     pub short_id: String,
+    pub created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -452,6 +454,7 @@ async fn upload_audio(
                 pinned: false,
                 pin_order: 0,
                 short_id,
+                created_at: DateTime::from(Utc::now()),
             };
             (StatusCode::CREATED, Json(ApiResponse::success(item)))
         }

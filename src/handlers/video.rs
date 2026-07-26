@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use tower_cookies::Cookies;
 use tracing::Instrument;
+use chrono::{DateTime, Utc};
 
 use crate::auth::validate_token;
 use crate::error_page::build_error_response;
@@ -26,7 +27,7 @@ use crate::AppState;
 // ─── Data Structures ───────────────────────────────────────────────────────────
 
 /// Column list used in all SELECT queries (keep in sync with VideoItem struct)
-const VIDEO_COLUMNS: &str = "id, user_id, title, description, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, transcoded_path, pinned, status, processing_progress, pin_order";
+const VIDEO_COLUMNS: &str = "id, user_id, title, description, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, transcoded_path, pinned, status, processing_progress, pin_order, created_at";
 
 #[derive(Debug, FromRow, Serialize, Clone)]
 pub struct VideoItem {
@@ -49,6 +50,7 @@ pub struct VideoItem {
     pub status: String,
     pub processing_progress: i32,
     pub pin_order: i32,
+    pub created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Serialize)]
@@ -814,6 +816,7 @@ async fn upload_video(
                     status: "processing".to_string(),
                     processing_progress: 0,
                     pin_order: 0,
+                    created_at: DateTime::from(Utc::now()),
                 });
             }
             Err(e) => {

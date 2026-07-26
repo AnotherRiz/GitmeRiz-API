@@ -50,7 +50,11 @@ Response `200`:
       "size_bytes": 5242880,
       "mime_type": "audio/mpeg",
       "visibility": "public",
-      "thumbnail_path": "audio/2026/07/2026-07-22/2026-07-22_14-26-40_3fa85f64-5717-4562-b3fc-2c963f66afa6-thumb.webp"
+      "thumbnail_path": "audio/2026/07/2026-07-22/2026-07-22_14-26-40_3fa85f64-5717-4562-b3fc-2c963f66afa6-thumb.webp",
+      "pinned": false,
+      "pin_order": 0,
+      "short_id": "AbC12XyZ",
+      "created_at": "2026-07-22 14:26:40"
     }
   ]
 }
@@ -76,7 +80,11 @@ Response `200`:
       "size_bytes": 3145728,
       "mime_type": "audio/mpeg",
       "visibility": "private",
-      "thumbnail_path": null
+      "thumbnail_path": null,
+      "pinned": false,
+      "pin_order": 0,
+      "short_id": "DeF45GhI",
+      "created_at": "2026-07-22 14:26:40"
     }
   ]
 }
@@ -106,7 +114,11 @@ Response `201`:
     "size_bytes": 2097152,
     "mime_type": "audio/mp4",
     "visibility": "private",
-    "thumbnail_path": "audio/2026/07/2026-07-22/2026-07-22_14-26-40_a1b2c3d4-e5f6-7890-abcd-ef1234567890-thumb.webp"
+    "thumbnail_path": "audio/2026/07/2026-07-22/2026-07-22_14-26-40_a1b2c3d4-e5f6-7890-abcd-ef1234567890-thumb.webp",
+    "pinned": false,
+    "pin_order": 0,
+    "short_id": "GhI67JkL",
+    "created_at": "2026-07-22 14:26:40"
   }
 }
 ```
@@ -165,7 +177,11 @@ Response `200`:
     "size_bytes": 5242880,
     "mime_type": "audio/mpeg",
     "visibility": "public",
-    "thumbnail_path": null
+    "thumbnail_path": null,
+    "pinned": false,
+    "pin_order": 0,
+    "short_id": "AbC12XyZ",
+    "created_at": "2026-07-22 14:26:40"
   }
 }
 ```
@@ -253,7 +269,8 @@ Response `200`:
     "thumbnail_path": null,
     "pinned": true,
     "pin_order": 3,
-    "short_id": "AbC12XyZ"
+    "short_id": "AbC12XyZ",
+    "created_at": "2026-07-22 14:26:40"
   }
 }
 ```
@@ -306,7 +323,8 @@ Response `200`:
       "thumbnail_path": null,
       "pinned": true,
       "pin_order": 1,
-      "short_id": "AbC12XyZ"
+      "short_id": "AbC12XyZ",
+      "created_at": "2026-07-22 14:26:40"
     },
     {
       "id": 2,
@@ -321,7 +339,8 @@ Response `200`:
       "thumbnail_path": null,
       "pinned": true,
       "pin_order": 2,
-      "short_id": "DeF45GhI"
+      "short_id": "DeF45GhI",
+      "created_at": "2026-07-22 14:26:45"
     }
   ]
 }
@@ -392,7 +411,8 @@ Response `200`:
     "thumbnail_path": null,
     "pinned": false,
     "pin_order": 0,
-    "short_id": "AbC12XyZ"
+    "short_id": "AbC12XyZ",
+    "created_at": "2026-07-22 14:26:40"
   }
 }
 ```
