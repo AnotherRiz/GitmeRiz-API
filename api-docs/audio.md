@@ -54,7 +54,7 @@ Response `200`:
       "pinned": false,
       "pin_order": 0,
       "short_id": "AbC12XyZ",
-      "created_at": "2026-07-22 14:26:40"
+      "created_at": "2026-07-22T14:26:40Z"
     }
   ]
 }
@@ -84,7 +84,7 @@ Response `200`:
       "pinned": false,
       "pin_order": 0,
       "short_id": "DeF45GhI",
-      "created_at": "2026-07-22 14:26:40"
+      "created_at": "2026-07-22T14:26:40Z"
     }
   ]
 }
@@ -118,7 +118,7 @@ Response `201`:
     "pinned": false,
     "pin_order": 0,
     "short_id": "GhI67JkL",
-    "created_at": "2026-07-22 14:26:40"
+    "created_at": "2026-07-22T14:26:40Z"
   }
 }
 ```
@@ -181,7 +181,7 @@ Response `200`:
     "pinned": false,
     "pin_order": 0,
     "short_id": "AbC12XyZ",
-    "created_at": "2026-07-22 14:26:40"
+    "created_at": "2026-07-22T14:26:40Z"
   }
 }
 ```
@@ -270,7 +270,7 @@ Response `200`:
     "pinned": true,
     "pin_order": 3,
     "short_id": "AbC12XyZ",
-    "created_at": "2026-07-22 14:26:40"
+    "created_at": "2026-07-22T14:26:40Z"
   }
 }
 ```
@@ -324,7 +324,7 @@ Response `200`:
       "pinned": true,
       "pin_order": 1,
       "short_id": "AbC12XyZ",
-      "created_at": "2026-07-22 14:26:40"
+      "created_at": "2026-07-22T14:26:40Z"
     },
     {
       "id": 2,
@@ -340,7 +340,7 @@ Response `200`:
       "pinned": true,
       "pin_order": 2,
       "short_id": "DeF45GhI",
-      "created_at": "2026-07-22 14:26:45"
+      "created_at": "2026-07-22T14:26:45Z"
     }
   ]
 }
@@ -412,7 +412,7 @@ Response `200`:
     "pinned": false,
     "pin_order": 0,
     "short_id": "AbC12XyZ",
-    "created_at": "2026-07-22 14:26:40"
+    "created_at": "2026-07-22T14:26:40Z"
   }
 }
 ```
