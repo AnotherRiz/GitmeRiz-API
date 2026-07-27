@@ -60,34 +60,53 @@ Response `200`:
 }
 ```
 
-## GET /audio
+## GET /audio/me
 
-Lists audio for the authenticated user. `superuser` sees all, others see only their own.
+Lists audio for the authenticated user with **cursor-based pagination**, newest first. `superuser` sees all, others see only their own.
 Requires authentication.
+
+**Query Parameters:**
+
+* `cursor` (optional): The `id` of the last item from the previous page.
+* `limit` (optional): Number of items per page. Defaults to `20`. Maximum `50`.
 
 Response `200`:
 ```json
 {
   "success": true,
-  "data": [
-    {
-      "id": 2,
-      "user_id": 1,
-      "title": "Private Song",
-      "description": "My private recording",
-      "original_filename": "private.mp3",
-      "stored_path": "audio/2026/07/2026-07-22/2026-07-22_14-26-40_550e8400-e29b-41d4-a716-446655440000.mp3",
-      "size_bytes": 3145728,
-      "mime_type": "audio/mpeg",
-      "visibility": "private",
-      "thumbnail_path": null,
-      "pinned": false,
-      "pin_order": 0,
-      "short_id": "DeF45GhI",
-      "created_at": "2026-07-22T14:26:40Z"
-    }
-  ]
+  "data": {
+    "items": [
+      {
+        "id": 2,
+        "user_id": 1,
+        "title": "Private Song",
+        "description": "My private recording",
+        "original_filename": "private.mp3",
+        "stored_path": "audio/2026/07/2026-07-22/2026-07-22_14-26-40_550e8400-e29b-41d4-a716-446655440000.mp3",
+        "size_bytes": 3145728,
+        "mime_type": "audio/mpeg",
+        "visibility": "private",
+        "thumbnail_path": null,
+        "pinned": false,
+        "pin_order": 0,
+        "short_id": "DeF45GhI",
+        "created_at": "2026-07-22T14:26:40Z"
+      }
+    ],
+    "next_cursor": 1,
+    "limit": 20
+  }
 }
+```
+
+```bash
+# Fetch first page
+curl http://localhost:3000/api/audio/me?limit=20 \
+  -H "Authorization: Bearer <token>"
+
+# Fetch next page using cursor
+curl "http://localhost:3000/api/audio/me?cursor=2&limit=20" \
+  -H "Authorization: Bearer <token>"
 ```
 
 ## POST /audio
@@ -208,15 +227,30 @@ Errors:
 curl -o cover.webp http://localhost:3000/api/audio/1/thumbnail
 ```
 
-## GET /audio/{id}/download
+## GET /audio/t/{short_id}
 
-Downloads the actual audio file (public endpoint with visibility check).
+Serves the cover art thumbnail image by `short_id` inline (WebP, cached 1 year). Public endpoint with visibility check.
 
 **Access rules:**
 - `public` items: no authentication required.
 - `private` items: requires authentication and ownership (or `superuser`).
 
-Returns the audio file with `Content-Disposition: attachment; filename="..."` header.
+Errors:
+- `401` — private audio and no authentication provided.
+- `403` — private audio and authenticated user is not the owner (and not `superuser`).
+- `404` — audio not found, has no thumbnail, or thumbnail file missing on disk.
+
+```bash
+curl -o cover.webp http://localhost:3000/api/audio/t/AbC12XyZ
+```
+
+## GET /audio/d/{id}
+
+Downloads the actual audio file by numeric id with `Content-Disposition: attachment` header (public endpoint with visibility check).
+
+**Access rules:**
+- `public` items: no authentication required.
+- `private` items: requires authentication and ownership (or `superuser`).
 
 Errors:
 - `401` — private audio and no authentication provided.
@@ -225,13 +259,13 @@ Errors:
 
 ```bash
 # Download a public audio file
-curl -o song.mp3 http://localhost:3000/api/audio/1/download
+curl -o song.mp3 http://localhost:3000/api/audio/d/1
 
 # Download a private audio file (with auth)
 curl -o song.mp3 \
   -H "Authorization: Bearer <token>" \
-
-## PATCH /audio/{id}
+  http://localhost:3000/api/audio/d/2
+```
 
 Updates audio metadata (title, description, visibility, or pinned status). Supports partial updates;
 at least one field must be provided. Owner or `superuser` only. Requires authentication.
@@ -428,14 +462,11 @@ curl http://localhost:3000/api/audio/info/AbC12XyZ
 
 ## GET /audio/download/{short_id}
 
-Downloads the actual audio file by `short_id` (public endpoint with visibility check).
-Same behavior as `GET /audio/{id}/download`, but uses the 8-character `short_id` instead of numeric `id`.
+Downloads the actual audio file by `short_id` with `Content-Disposition: attachment` header (public endpoint with visibility check).
 
 **Access rules:**
 - `public` items: no authentication required.
 - `private` items: requires authentication and ownership (or `superuser`).
-
-Returns the audio file with `Content-Disposition: attachment; filename="..."` header.
 
 Errors:
 - `401` — private audio and no authentication provided.
@@ -452,23 +483,34 @@ curl -o song.mp3 \
   http://localhost:3000/api/audio/download/DeF45GhI
 ```
 
-## GET /audio/thumb/{short_id}
+## GET /audio/r/{short_id}
 
-Serves the cover art thumbnail image inline (WebP, cached 1 year) by `short_id`.
-Same behavior as `GET /audio/{id}/thumbnail`, but uses the 8-character `short_id` instead of numeric `id`.
-Public endpoint with visibility check.
+Streams the audio file inline with HTTP **206 Partial Content** and `Range` header support. Allows the frontend audio player to seek/scrub to any position instantly. Public endpoint with visibility check.
 
 **Access rules:**
 - `public` items: no authentication required.
 - `private` items: requires authentication and ownership (or `superuser`).
 
+**Range Requests:**
+- Clients can send `Range: bytes=1024-2047` to request a byte range.
+- Server responds with `206 Partial Content` and includes `Content-Range: bytes 1024-2047/total` header.
+- Without `Range` header, returns full file with `200 OK`.
+- Includes `Accept-Ranges: bytes` header to advertise range support.
+
 Errors:
 - `401` — private audio and no authentication provided.
 - `403` — private audio and authenticated user is not the owner (and not `superuser`).
-- `404` — audio not found, has no thumbnail, or thumbnail file missing on disk.
+- `404` — audio not found or file missing on disk.
 
 ```bash
-curl -o cover.webp http://localhost:3000/api/audio/thumb/AbC12XyZ
+# Stream full audio
+curl http://localhost:3000/api/audio/r/AbC12XyZ --output audio.mp3
+
+# Request a specific byte range (e.g., skip first 1 MB)
+curl -H "Range: bytes=1048576-" http://localhost:3000/api/audio/r/AbC12XyZ
+
+# Request with auth token
+curl -H "Authorization: Bearer <token>" http://localhost:3000/api/audio/r/DeF45GhI
 ```
 
 ## DELETE /audio/{id}
