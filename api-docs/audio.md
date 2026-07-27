@@ -210,23 +210,6 @@ Errors:
 - `403` — private audio and authenticated user is not the owner (and not `superuser`).
 - `404` — audio not found.
 
-## GET /audio/{id}/thumbnail
-
-Serves the cover art thumbnail image inline (WebP, cached 1 year). Public endpoint with visibility check.
-
-**Access rules:**
-- `public` items: no authentication required.
-- `private` items: requires authentication and ownership (or `superuser`).
-
-Errors:
-- `401` — private audio and no authentication provided.
-- `403` — private audio and authenticated user is not the owner (and not `superuser`).
-- `404` — audio not found, has no thumbnail, or thumbnail file missing on disk.
-
-```bash
-curl -o cover.webp http://localhost:3000/api/audio/1/thumbnail
-```
-
 ## GET /audio/t/{short_id}
 
 Serves the cover art thumbnail image by `short_id` inline (WebP, cached 1 year). Public endpoint with visibility check.

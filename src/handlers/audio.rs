@@ -80,16 +80,17 @@ pub fn public_routes() -> Router<Arc<AppState>> {
         .route("/audio/public", get(list_public_audio))
         .route("/audio/info/{short_id}", get(get_audio_by_short_id))
         .route("/audio/download/{short_id}", get(download_audio_by_short_id))
-        .route("/audio/thumb/{short_id}", get(serve_audio_thumbnail_by_short_id))
+        .route("/audio/t/{short_id}", get(serve_audio_thumbnail_by_short_id))
         .route("/audio/{id}", get(get_audio))
-        .route("/audio/{id}/download", get(download_audio))
-        .route("/audio/{id}/thumbnail", get(serve_audio_thumbnail))
+        .route("/audio/d/{id}", get(download_audio))
+        .route("/audio/r/{short_id}", get(serve_audio_stream))
 }
 
 /// Protected routes (require auth middleware)
 pub fn protected_routes() -> Router<Arc<AppState>> {
     Router::new()
-        .route("/audio", get(list_audio).post(upload_audio))
+        .route("/audio", post(upload_audio))
+        .route("/audio/me", get(list_my_audio))
         .route("/audio/{id}", patch(update_audio).delete(delete_audio))
         .route("/audio/me/pinned", get(list_pinned_audio))
         .route("/audio/reorder-pins", patch(reorder_audio_pins))
@@ -159,8 +160,8 @@ async fn ffmpeg_remux_aac_to_m4a(input_path: &str, output_path: &str) -> Result<
 
 // ─── Handler Functions ─────────────────────────────────────────────────────────
 
-// GET /api/audio - List audio (superuser sees all, others see only their own)
-async fn list_audio(
+// GET /api/audio/me - List audio (superuser sees all, others see only their own) with cursor pagination
+async fn list_my_audio(
     Extension(auth_user): Extension<AuthUser>,
     State(state): State<Arc<AppState>>,
 ) -> (StatusCode, Json<ApiResponse<Vec<AudioItem>>>) {
@@ -604,86 +605,6 @@ async fn download_audio(
 }
 
 // GET /api/audio/:id/thumbnail - Serve the audio cover art thumbnail (public endpoint with visibility check)
-async fn serve_audio_thumbnail(
-    State(state): State<Arc<AppState>>,
-    cookies: Cookies,
-    headers: HeaderMap,
-    Path(id): Path<i32>,
-) -> impl IntoResponse {
-    let item: Result<AudioItem, _> = sqlx::query_as(&format!(
-        "SELECT {} FROM audio WHERE id = ?",
-        AUDIO_COLUMNS
-    ))
-    .bind(id)
-    .fetch_one(&state.db.pool)
-    .await;
-
-    let item = match item {
-        Ok(item) => item,
-        Err(_) => {
-            return build_error_response(
-                StatusCode::NOT_FOUND,
-                "Audio not found",
-                &headers,
-                &state.config.frontend_url,
-            );
-        }
-    };
-
-    // Access control for private audio
-    if item.visibility == "private" {
-        let auth_user = extract_optional_auth(&cookies, &headers, &state.config.jwt_secret);
-        match auth_user {
-            Some(user) => {
-                if item.user_id != user.id && !user.is_superuser() {
-                    return build_error_response(
-                        StatusCode::FORBIDDEN,
-                        "You can only access your own private audio",
-                        &headers,
-                        &state.config.frontend_url,
-                    );
-                }
-            }
-            None => {
-                return build_error_response(
-                    StatusCode::UNAUTHORIZED,
-                    "This audio is private. Authentication required.",
-                    &headers,
-                    &state.config.frontend_url,
-                );
-            }
-        }
-    }
-
-    let thumb_path = match &item.thumbnail_path {
-        Some(p) => p,
-        None => {
-            return build_error_response(
-                StatusCode::NOT_FOUND,
-                "This audio has no thumbnail",
-                &headers,
-                &state.config.frontend_url,
-            );
-        }
-    };
-
-    match read_file(&state.config.storage_dir, thumb_path).await {
-        Ok(data) => Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "image/webp")
-            .header(header::CACHE_CONTROL, "public, max-age=31536000") // 1 year
-            .body(Body::from(data))
-            .unwrap()
-            .into_response(),
-        Err(_) => build_error_response(
-            StatusCode::NOT_FOUND,
-            "Thumbnail not found on disk",
-            &headers,
-            &state.config.frontend_url,
-        ),
-    }
-}
-
 // PATCH /api/audio/:id - Update audio (owner or superuser) - supports partial updates of title, description, visibility, and pinned
 async fn update_audio(
     Extension(auth_user): Extension<AuthUser>,
@@ -1738,6 +1659,152 @@ async fn delete_audio_thumbnail(
         Err(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ApiResponse::error("Failed to delete thumbnail")),
+        ),
+    }
+}
+// GET /api/audio/r/:short_id - Stream audio file with HTTP 206 Range support
+async fn serve_audio_stream(
+    State(state): State<Arc<AppState>>,
+    Path(short_id): Path<String>,
+    cookies: Cookies,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    use axum::http::header;
+    use axum::response::{Response, IntoResponse};
+    use axum::body::Body;
+
+    let item: Result<AudioItem, _> = sqlx::query_as(&format!(
+        "SELECT {} FROM audio WHERE short_id = ?",
+        AUDIO_COLUMNS
+    ))
+    .bind(&short_id)
+    .fetch_one(&state.db.pool)
+    .await;
+
+    let item = match item {
+        Ok(item) => item,
+        Err(_) => {
+            return build_error_response(
+                StatusCode::NOT_FOUND,
+                "Audio not found",
+                &headers,
+                &state.config.frontend_url,
+            );
+        }
+    };
+
+    // Access control for private audio
+    if item.visibility == "private" {
+        let auth_user = extract_optional_auth(&cookies, &headers, &state.config.jwt_secret);
+        match auth_user {
+            Some(user) => {
+                if item.user_id != user.id && !user.is_superuser() {
+                    return build_error_response(
+                        StatusCode::FORBIDDEN,
+                        "You can only access your own private audio",
+                        &headers,
+                        &state.config.frontend_url,
+                    );
+                }
+            }
+            None => {
+                return build_error_response(
+                    StatusCode::UNAUTHORIZED,
+                    "This audio is private. Authentication required.",
+                    &headers,
+                    &state.config.frontend_url,
+                );
+            }
+        }
+    }
+
+    let full_path = std::path::PathBuf::from(&state.config.storage_dir).join(&item.stored_path);
+
+    let file_metadata = match tokio::fs::metadata(&full_path).await {
+        Ok(m) => m,
+        Err(_) => {
+            return build_error_response(
+                StatusCode::NOT_FOUND,
+                "Audio file not found on disk",
+                &headers,
+                &state.config.frontend_url,
+            );
+        }
+    };
+
+    let file_size = file_metadata.len();
+    let content_type = &item.mime_type;
+
+    // Parse Range header for HTTP 206 Partial Content
+    if let Some(range_header) = headers.get(header::RANGE) {
+        let range_str = range_header.to_str().unwrap_or("");
+        if let Some(range) = crate::media::parse_range_header(range_str, file_size) {
+            let (start, end) = range;
+            let chunk_size = end - start + 1;
+
+            // Read the requested range from file
+            let mut file = match tokio::fs::File::open(&full_path).await {
+                Ok(f) => f,
+                Err(_) => {
+                    return build_error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Failed to open audio file",
+                        &headers,
+                        &state.config.frontend_url,
+                    );
+                }
+            };
+
+            use tokio::io::{AsyncReadExt, AsyncSeekExt};
+            if let Err(_) = file.seek(std::io::SeekFrom::Start(start)).await {
+                return build_error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to seek in audio file",
+                    &headers,
+                    &state.config.frontend_url,
+                );
+            }
+
+            let mut buffer = vec![0u8; chunk_size as usize];
+            if let Err(_) = file.read_exact(&mut buffer).await {
+                return build_error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to read audio file range",
+                    &headers,
+                    &state.config.frontend_url,
+                );
+            }
+
+            return Response::builder()
+                .status(StatusCode::PARTIAL_CONTENT)
+                .header(header::CONTENT_TYPE, content_type)
+                .header(header::CONTENT_LENGTH, chunk_size.to_string())
+                .header(header::ACCEPT_RANGES, "bytes")
+                .header(
+                    header::CONTENT_RANGE,
+                    format!("bytes {}-{}/{}", start, end, file_size),
+                )
+                .body(Body::from(buffer))
+                .unwrap()
+                .into_response();
+        }
+    }
+
+    // No Range header — serve full file
+    match tokio::fs::read(&full_path).await {
+        Ok(data) => Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, content_type)
+            .header(header::CONTENT_LENGTH, file_size.to_string())
+            .header(header::ACCEPT_RANGES, "bytes")
+            .body(Body::from(data))
+            .unwrap()
+            .into_response(),
+        Err(_) => build_error_response(
+            StatusCode::NOT_FOUND,
+            "Audio file not found on disk",
+            &headers,
+            &state.config.frontend_url,
         ),
     }
 }
