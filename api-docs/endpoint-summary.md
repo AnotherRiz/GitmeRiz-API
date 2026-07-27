@@ -51,7 +51,6 @@
 | POST | `/audio` | Yes | Upload audio (multipart, no size limit); supports title/description/visibility/thumbnail (all optional except file); `.aac` auto-remuxed to `.m4a` |
 | GET | `/audio/{id}` | Optional | Get audio metadata by id (public: no auth, private: cookie/header) |
 | GET | `/audio/d/{id}` | Optional | Download audio file with attachment header by numeric id (public: no auth, private: cookie/header) |
-| GET | `/audio/{id}/thumbnail` | Optional | Serve cover art thumbnail inline, WebP cached 1 year (public: no auth, private: cookie/header) |
 | GET | `/audio/t/{short_id}` | Optional | Serve cover art thumbnail by short_id inline, WebP cached 1 year (public: no auth, private: cookie/header) |
 | PATCH | `/audio/{id}` | Yes | Unified partial update: title/description/visibility/pinned (owner / superuser, max 8 pinned per user) |
 | GET | `/audio/me/pinned` | Yes | List current user's pinned audio (no pagination, max 8) |

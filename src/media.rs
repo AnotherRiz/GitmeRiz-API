@@ -392,3 +392,35 @@ pub async fn save_file_streaming(
     file.flush().await?;
     Ok(total_bytes)
 }
+
+/// Parse a Range header like "bytes=0-1023" into (start, end) tuple.
+/// Returns None if the range is invalid or malformed.
+pub fn parse_range_header(range_str: &str, file_size: u64) -> Option<(u64, u64)> {
+    let range_str = range_str.strip_prefix("bytes=")?;
+    let mut parts = range_str.splitn(2, '-');
+    let start_str = parts.next()?;
+    let end_str = parts.next()?;
+
+    let start: u64 = if start_str.is_empty() {
+        // Suffix range: e.g. bytes=-500 (last 500 bytes)
+        let suffix: u64 = end_str.parse().ok()?;
+        file_size.saturating_sub(suffix)
+    } else {
+        start_str.parse().ok()?
+    };
+
+    let end: u64 = if end_str.is_empty() {
+        file_size - 1
+    } else {
+        end_str.parse().ok()?
+    };
+
+    // Clamp end to file boundary
+    let end = end.min(file_size - 1);
+
+    if start <= end && start < file_size {
+        Some((start, end))
+    } else {
+        None
+    }
+}
