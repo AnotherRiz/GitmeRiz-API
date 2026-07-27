@@ -59,7 +59,6 @@ pub struct VideoItem {
 #[serde(untagged)]
 pub enum UploadResponse {
     Single(VideoItem),
-    Bulk(Vec<VideoItem>),
 }
 
 #[derive(Debug, Deserialize)]
