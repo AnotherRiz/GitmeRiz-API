@@ -33,7 +33,7 @@
 | GET | `/video/public` | No | List all public videos with cursor pagination - supports `?cursor={id}&limit=20` |
 | GET | `/video/me` | Yes | List current user's videos (public & private) with cursor pagination |
 | GET | `/video/me/pinned` | Yes | List current user's pinned videos (no pagination, max 4) |
-| POST | `/video` | Yes | Upload video(s) (multipart, no size limit, up to 5 files); returns `202`, processes in background via FFmpeg |
+| POST | `/video` | Yes | Upload single video file (multipart, no size limit); optional thumbnail support (5 MB max); returns `202`, processes in background via FFmpeg |
 | POST | `/video/status` | Yes | Check processing status of up to 100 video ids (own only) |
 | GET | `/video/{id}` | Optional | Get video metadata by numeric id (public: no auth, private: cookie/header) |
 | GET | `/video/d/{id}` | Optional | Download video file with attachment header by numeric id (public: no auth, private: cookie/header) |
@@ -43,6 +43,7 @@
 | GET | `/video/t/{short_id}` | Optional | Serve pre-generated thumbnail (WebP, cached 1 year) |
 | PATCH | `/video/{id}` | Yes | Unified partial update: title/description/visibility/pinned (owner / superuser) |
 | PATCH | `/video/reorder-pins` | Yes | Persist custom order for pinned videos (max 4, owner / superuser) |
+| PUT | `/video/{id}/thumbnail` | Yes | Replace video thumbnail with custom image (multipart, 5 MB max image) (owner / superuser) |
 | POST | `/video/{id}/reprocess` | Yes | Retry FFmpeg thumbnail + transcoding - returns `202`, processes in background (owner / superuser) |
 | DELETE | `/video/{id}` | Yes | Delete video + all files (original, transcoded, thumbnail) (owner / superuser) |
 | GET | `/audio/public` | No | List all public audio items |
@@ -57,7 +58,12 @@
 | GET | `/audio/info/{short_id}` | Optional | Get audio metadata by short_id (public: no auth, private: cookie/header) |
 | GET | `/audio/download/{short_id}` | Optional | Download audio file by short_id with attachment header (public: no auth, private: cookie/header) |
 | GET | `/audio/thumb/{short_id}` | Optional | Serve cover art thumbnail by short_id inline, WebP cached 1 year (public: no auth, private: cookie/header) |
-| DELETE | `/audio/{id}` | Yes | Delete audio + file + thumbnail (owner / superuser) |
+| POST | `/audio/{id}/thumbnails` | Yes | Add multiple thumbnail images (multipart, up to 20 per audio, 5 MB max each) (owner / superuser) |
+| GET | `/audio/{id}/thumbnails` | Yes | List all thumbnails for an audio item (owner / superuser) |
+| GET | `/audio/{id}/thumbnails/{thumbnail_id}` | No | Serve a specific thumbnail image inline (WebP, cached 1 year) |
+| PATCH | `/audio/{id}/thumbnails/{thumbnail_id}` | Yes | Set a thumbnail as primary cover art (owner / superuser) |
+| DELETE | `/audio/{id}/thumbnails/{thumbnail_id}` | Yes | Delete a specific thumbnail (owner / superuser) |
+| DELETE | `/audio/{id}` | Yes | Delete audio + file + all thumbnails (owner / superuser) |
 | GET | `/blog` | Yes | List published posts |
 | POST | `/blog` | Yes | Create post (admin / superuser) |
 | GET | `/blog/{id}` | Yes | Get post |

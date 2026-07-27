@@ -17,7 +17,8 @@ and a `status`.
 
 - **Size limit:** No strict limit (backend streams chunks directly to disk to prevent OOM).
 - **Allowed extensions:** `.mp4`, `.webm`, `.mov`, `.avi`, `.mkv`
-- Bulk upload limit: Up to **5 files** in a single request.
+- **Single file only** — Bulk upload is disabled. Each upload must contain exactly one video file.
+- **Optional custom thumbnail:** Max 5 MB, image extensions (`.jpg`, `.jpeg`, `.png`, `.webp`, `.gif`).
 
 ## Background Processing & Transcoding
 
@@ -54,11 +55,12 @@ and a `status`.
   "pinned": false,
   "status": "active",
   "pin_order": 0,
+  "thumbnail_is_custom": false,
   "created_at": "2026-06-30T14:25:10Z"
 }
 ```
 
-*Note: `transcoded_path` is present only if the original was non-web-safe. The streaming/download endpoints automatically serve the transcoded file when available. `created_at` is an ISO 8601 timestamp in UTC.*
+*Note: `transcoded_path` is present only if the original was non-web-safe. `thumbnail_is_custom` indicates whether the thumbnail was user-provided (`true`) or auto-extracted by FFmpeg (`false`). The streaming/download endpoints automatically serve the transcoded file when available. `created_at` is an ISO 8601 timestamp in UTC.*
 
 ---
 
@@ -120,23 +122,26 @@ Response `200`:
 
 ## POST /video
 
-Uploads video file(s). **Requires authentication.** Uses `multipart/form-data`:
+Uploads a single video file. **Requires authentication.** Uses `multipart/form-data`:
 
 | Field | Required | Description |
 | --- | --- | --- |
-| `file` | Yes | The video file(s). Bulk upload max 5 files. |
-| `title` | No | Display title (used for single uploads). |
+| `file` | Yes | The video file. Single file only. |
+| `title` | No | Display title. |
 | `description` | No | Video description. |
 | `visibility` | No | `public` or `private`. Defaults to `private`. |
+| `thumbnail` | No | Optional custom thumbnail image (max 5 MB, image extensions). If provided, this will be used instead of auto-extracted. |
 
 **Upload process:**
 
-1. Streams file directly to disk (prevents RAM spikes).
-2. Generates a unique `short_id` and inserts metadata into the database (`status: "processing"`).
-3. **Returns `202 Accepted` immediately.**
-4. In the background: FFmpeg extracts a WebP thumbnail and transcodes the video to `.mp4` if necessary. Updates status to `active` or `failed_processing`.
+1. Validates that exactly one video file is provided. Returns `400 Bad Request` if multiple files are sent.
+2. Streams file directly to disk (prevents RAM spikes).
+3. If a custom thumbnail is provided, resizes and converts it to WebP (max 500px width, quality 80) **synchronously before returning**. Thumbnail processing failure is non-fatal and does not fail the upload.
+4. Generates a unique `short_id` and inserts metadata into the database (`status: "processing"`).
+5. **Returns `202 Accepted` immediately.**
+6. In the background: FFmpeg extracts a WebP thumbnail (only if `thumbnail_is_custom` is `false`) and transcodes the video to `.mp4` if necessary. Updates status to `active` or `failed_processing`.
 
-Response `202` (single file):
+Response `202`:
 
 ```json
 {
@@ -146,6 +151,7 @@ Response `202` (single file):
     "title": "Vacation Clip",
     "short_id": "vX9mP2qL",
     "status": "processing",
+    "thumbnail_is_custom": true,
     ...
   }
 }
@@ -204,6 +210,38 @@ Request body:
 
 ```json
 { "ordered_ids": [3, 1, 4, 2] }
+```
+
+## PUT /video/{id}/thumbnail
+
+Replaces a video's thumbnail with a custom image. **Requires authentication.** Owner or superuser only.
+
+| Field | Required | Description |
+| --- | --- | --- |
+| `thumbnail` | Yes | Custom thumbnail image (max 5 MB, image extensions). |
+
+**Process:**
+
+1. Validates thumbnail extension and size.
+2. Deletes the old thumbnail file from disk (if it exists).
+3. Generates a WebP version (max 500px width, quality 80) and saves it.
+4. Updates `thumbnail_path` and sets `thumbnail_is_custom = true` in the database.
+5. Returns `200 OK` with updated `VideoItem`.
+
+Thumbnail processing failure returns `500 Internal Server Error`.
+
+Response `200`:
+
+```json
+{
+  "success": true,
+  "data": {
+    "id": 1,
+    "thumbnail_path": "video/2026/06/.../new-thumb.webp",
+    "thumbnail_is_custom": true,
+    ...
+  }
+}
 ```
 
 ## DELETE /video/{id}
