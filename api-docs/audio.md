@@ -473,7 +473,7 @@ curl -o cover.webp http://localhost:3000/api/audio/thumb/AbC12XyZ
 
 ## DELETE /audio/{id}
 
-Deletes an audio item (database record and file on disk). Owner or `superuser` only.
+Deletes an audio item (database record and all files on disk, including all thumbnails). Owner or `superuser` only.
 Requires authentication.
 
 Response `200`:
@@ -491,5 +491,177 @@ Errors:
 
 ```bash
 curl -X DELETE http://localhost:3000/api/audio/1 \
+  -H "Authorization: Bearer <token>"
+```
+
+---
+
+## Audio Thumbnails (Multiple Cover Art Images)
+
+Audio items support **multiple cover art thumbnails** (up to 20 per item). One thumbnail is marked as primary and displayed as the audio's cover art. All thumbnail endpoints require authentication.
+
+---
+
+## POST /audio/{id}/thumbnails
+
+Adds one or more thumbnail images to an audio item (up to 20 total per item). Requires authentication. Owner or `superuser` only.
+
+**Constraints:**
+- Max 20 thumbnails per audio item.
+- Each thumbnail: max 5 MB, image extensions (`.jpg`, `.jpeg`, `.png`, `.webp`, `.gif`).
+- Upload multiple files via repeated `thumbnails` multipart fields.
+
+**Request:** `multipart/form-data`
+- `thumbnails` (repeated) — thumbnail image file(s).
+
+If the audio has no primary thumbnail yet, the first successfully-added thumbnail becomes primary.
+
+Response `201`:
+```json
+{
+  "success": true,
+  "data": [
+    {
+      "id": 1,
+      "audio_id": 5,
+      "thumbnail_path": "audio/2026/07/2026-07-22/2026-07-22_14-26-40_UUID-thumb.webp",
+      "is_primary": true,
+      "sort_order": 0,
+      "created_at": "2026-07-22T14:26:40Z"
+    },
+    {
+      "id": 2,
+      "audio_id": 5,
+      "thumbnail_path": "audio/2026/07/2026-07-22/2026-07-22_14-26-41_UUID-thumb.webp",
+      "is_primary": false,
+      "sort_order": 1,
+      "created_at": "2026-07-22T14:26:41Z"
+    }
+  ]
+}
+```
+
+Errors:
+- `400` — maximum 20 thumbnails reached, or no valid thumbnails were uploaded.
+- `403` — authenticated user does not own the audio.
+- `404` — audio not found.
+- `500` — database or file system error.
+
+```bash
+# Add a single thumbnail
+curl -X POST http://localhost:3000/api/audio/5/thumbnails \
+  -H "Authorization: Bearer <token>" \
+  -F "thumbnails=@cover1.jpg"
+
+# Add multiple thumbnails at once
+curl -X POST http://localhost:3000/api/audio/5/thumbnails \
+  -H "Authorization: Bearer <token>" \
+  -F "thumbnails=@cover1.jpg" \
+  -F "thumbnails=@cover2.png" \
+  -F "thumbnails=@cover3.webp"
+```
+
+## GET /audio/{id}/thumbnails
+
+Lists all thumbnail images for an audio item, ordered by `sort_order` ascending, then by `id` ascending.
+Requires authentication. Owner or `superuser` only.
+
+Response `200`:
+```json
+{
+  "success": true,
+  "data": [
+    {
+      "id": 1,
+      "audio_id": 5,
+      "thumbnail_path": "audio/2026/07/2026-07-22/2026-07-22_14-26-40_UUID-thumb.webp",
+      "is_primary": true,
+      "sort_order": 0,
+      "created_at": "2026-07-22T14:26:40Z"
+    },
+    {
+      "id": 2,
+      "audio_id": 5,
+      "thumbnail_path": "audio/2026/07/2026-07-22/2026-07-22_14-26-41_UUID-thumb.webp",
+      "is_primary": false,
+      "sort_order": 1,
+      "created_at": "2026-07-22T14:26:41Z"
+    }
+  ]
+}
+```
+
+Errors:
+- `403` — authenticated user does not own the audio.
+- `404` — audio not found.
+- `500` — database error.
+
+```bash
+curl http://localhost:3000/api/audio/5/thumbnails \
+  -H "Authorization: Bearer <token>"
+```
+
+## GET /audio/{id}/thumbnails/{thumbnail_id}
+
+Serves a specific thumbnail image inline (WebP, cached 1 year). Public endpoint.
+
+Response `200`: WebP image data (`Content-Type: image/webp`).
+
+Errors:
+- `404` — thumbnail not found or file missing on disk.
+
+```bash
+curl -o alternate_cover.webp http://localhost:3000/api/audio/5/thumbnails/2
+```
+
+## PATCH /audio/{id}/thumbnails/{thumbnail_id}
+
+Sets a specific thumbnail as primary (replaces the currently-displayed cover art). Requires authentication. Owner or `superuser` only.
+
+**Request body:** (empty or no body required)
+
+Response `200`:
+```json
+{
+  "success": true,
+  "data": "Primary thumbnail updated"
+}
+```
+
+- Unsets all other thumbnails from primary status.
+- Updates `audio.thumbnail_path` to point to this thumbnail.
+
+Errors:
+- `403` — authenticated user does not own the audio.
+- `404` — audio or thumbnail not found.
+- `500` — database error.
+
+```bash
+curl -X PATCH http://localhost:3000/api/audio/5/thumbnails/2 \
+  -H "Authorization: Bearer <token>"
+```
+
+## DELETE /audio/{id}/thumbnails/{thumbnail_id}
+
+Deletes a specific thumbnail image. Requires authentication. Owner or `superuser` only.
+
+Response `200`:
+```json
+{
+  "success": true,
+  "data": "Thumbnail deleted"
+}
+```
+
+- If the deleted thumbnail was primary, the next thumbnail (in `sort_order` order) is automatically promoted to primary.
+- If this was the last thumbnail, `audio.thumbnail_path` is cleared.
+
+Errors:
+- `403` — authenticated user does not own the audio.
+- `404` — audio or thumbnail not found.
+- `500` — database or file system error.
+
+```bash
+curl -X DELETE http://localhost:3000/api/audio/5/thumbnails/2 \
   -H "Authorization: Bearer <token>"
 ```

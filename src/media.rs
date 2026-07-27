@@ -4,6 +4,12 @@ use std::path::PathBuf;
 use tokio::fs;
 use uuid::Uuid;
 
+/// Allowed extensions for user-uploaded thumbnail/cover art images (Video + Audio)
+pub const ALLOWED_THUMBNAIL_EXTENSIONS: &[&str] = &[".jpg", ".jpeg", ".png", ".webp", ".gif"];
+
+/// Max size for a single user-uploaded thumbnail image
+pub const MAX_THUMBNAIL_SIZE_BYTES: u64 = 5 * 1024 * 1024; // 5 MB
+
 /// Media type for organizing uploads
 #[derive(Debug, Clone, Copy)]
 pub enum MediaType {
@@ -113,6 +119,37 @@ pub fn validate_size(media_type: MediaType, size_bytes: u64) -> Result<(), Strin
             ));
         }
     }
+    Ok(())
+}
+
+/// Validate a user-uploaded thumbnail image: extension + size.
+/// `filename` is the original filename from the multipart field.
+pub fn validate_thumbnail(filename: &str, size_bytes: usize) -> Result<(), String> {
+    let ext = filename
+        .rsplit('.')
+        .next()
+        .map(|e| format!(".{}", e.to_lowercase()));
+
+    let is_allowed_ext = ext
+        .as_deref()
+        .map(|e| ALLOWED_THUMBNAIL_EXTENSIONS.contains(&e))
+        .unwrap_or(false);
+
+    if !is_allowed_ext {
+        return Err(format!(
+            "Invalid thumbnail extension. Allowed: {}",
+            ALLOWED_THUMBNAIL_EXTENSIONS.join(", ")
+        ));
+    }
+
+    if size_bytes as u64 > MAX_THUMBNAIL_SIZE_BYTES {
+        let max_mb = MAX_THUMBNAIL_SIZE_BYTES / (1024 * 1024);
+        return Err(format!(
+            "Thumbnail size exceeds maximum allowed size ({} MB)",
+            max_mb
+        ));
+    }
+
     Ok(())
 }
 

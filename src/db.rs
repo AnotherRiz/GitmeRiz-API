@@ -408,6 +408,20 @@ impl Database {
                 .await?;
         }
 
+        // Add thumbnail_is_custom column to videos (true when user uploaded their own thumbnail)
+        let has_video_thumbnail_custom = matches!(
+            sqlx::query("SHOW COLUMNS FROM videos LIKE 'thumbnail_is_custom'")
+                .fetch_optional(&self.pool)
+                .await,
+            Ok(Some(_))
+        );
+        if !has_video_thumbnail_custom {
+            tracing::info!("Adding thumbnail_is_custom column to videos table");
+            sqlx::query("ALTER TABLE videos ADD COLUMN thumbnail_is_custom BOOLEAN NOT NULL DEFAULT FALSE")
+                .execute(&self.pool)
+                .await?;
+        }
+
         // Create audio table with file storage columns
         sqlx::query(
             r#"
@@ -544,6 +558,52 @@ impl Database {
                 .await?;
 
             tracing::info!("Audio short_id column added and backfilled successfully");
+        }
+
+        // Create audio_thumbnails table (supports multiple cover art images per audio item)
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS audio_thumbnails (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                audio_id INT NOT NULL,
+                thumbnail_path VARCHAR(512) NOT NULL,
+                is_primary BOOLEAN NOT NULL DEFAULT FALSE,
+                sort_order INT NOT NULL DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (audio_id) REFERENCES audio(id) ON DELETE CASCADE
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // Backfill audio_thumbnails with existing thumbnail_path values
+        let existing_thumbnails: Result<Vec<(i32, String)>, _> = sqlx::query_as(
+            "SELECT id, thumbnail_path FROM audio WHERE thumbnail_path IS NOT NULL"
+        )
+        .fetch_all(&self.pool)
+        .await;
+
+        if let Ok(rows) = existing_thumbnails {
+            for (audio_id, thumb_path) in rows {
+                let already_exists: Result<Option<(i32,)>, _> = sqlx::query_as(
+                    "SELECT id FROM audio_thumbnails WHERE audio_id = ? AND thumbnail_path = ?"
+                )
+                .bind(audio_id)
+                .bind(&thumb_path)
+                .fetch_optional(&self.pool)
+                .await;
+
+                if matches!(already_exists, Ok(None)) {
+                    let _ = sqlx::query(
+                        "INSERT INTO audio_thumbnails (audio_id, thumbnail_path, is_primary, sort_order) VALUES (?, ?, TRUE, 0)"
+                    )
+                    .bind(audio_id)
+                    .bind(&thumb_path)
+                    .execute(&self.pool)
+                    .await;
+                }
+            }
         }
 
         // Create blog_posts table

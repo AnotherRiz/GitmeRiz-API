@@ -1,11 +1,12 @@
 use std::sync::Arc;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use axum::{
     body::Body,
     extract::{Multipart, Path, Query, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::{get, patch, post},
+    routing::{get, patch, post, put},
     Extension, Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -19,7 +20,7 @@ use crate::error_page::build_error_response;
 use crate::media::{
     delete_file, generate_short_id, generate_storage_path, generate_thumbnail_path,
     generate_transcoded_path, get_extension, is_web_safe_video, save_file_streaming,
-    validate_extension, MediaType,
+    validate_extension, validate_thumbnail, generate_thumbnail_only, MediaType,
 };
 use crate::models::{ApiResponse, AuthUser};
 use crate::AppState;
@@ -27,7 +28,7 @@ use crate::AppState;
 // ─── Data Structures ───────────────────────────────────────────────────────────
 
 /// Column list used in all SELECT queries (keep in sync with VideoItem struct)
-const VIDEO_COLUMNS: &str = "id, user_id, title, description, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, transcoded_path, pinned, status, processing_progress, pin_order, created_at";
+const VIDEO_COLUMNS: &str = "id, user_id, title, description, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, thumbnail_path, transcoded_path, pinned, status, processing_progress, pin_order, thumbnail_is_custom, created_at";
 
 #[derive(Debug, FromRow, Serialize, Clone)]
 pub struct VideoItem {
@@ -50,6 +51,7 @@ pub struct VideoItem {
     pub status: String,
     pub processing_progress: i32,
     pub pin_order: i32,
+    pub thumbnail_is_custom: bool,
     pub created_at: DateTime<Utc>,
 }
 
@@ -116,6 +118,7 @@ pub fn protected_routes() -> Router<Arc<AppState>> {
         .route("/video/status", post(check_status))
         .route("/video/reorder-pins", patch(reorder_pins))
         .route("/video/{id}", patch(update_video).delete(delete_video))
+        .route("/video/{id}/thumbnail", put(replace_video_thumbnail))
         .route("/video/{id}/reprocess", post(reprocess_video))
 }
 
@@ -335,6 +338,7 @@ pub fn spawn_background_processing(
     item_id: i32,
     stored_path: String,
     filename: String,
+    thumbnail_is_custom: bool,
 ) {
     let db_pool = state.db.pool.clone();
     let storage_dir = state.config.storage_dir.clone();
@@ -370,25 +374,34 @@ pub fn spawn_background_processing(
         let duration = get_video_duration(&input_path_str).await;
         tracing::info!(%batch_id, item_id, ?duration, "Video duration fetched");
 
-        // Step 1: Thumbnail extraction
-        let thumb_relative = generate_thumbnail_path(&stored_path);
-        let thumb_full_path = std::path::PathBuf::from(&storage_dir).join(&thumb_relative);
+        // Step 1: Thumbnail extraction (skip if custom thumbnail was provided)
+        let final_thumb = if !thumbnail_is_custom {
+            let thumb_relative = generate_thumbnail_path(&stored_path);
+            let thumb_full_path = std::path::PathBuf::from(&storage_dir).join(&thumb_relative);
 
-        if let Some(parent) = thumb_full_path.parent() {
-            let _ = tokio::fs::create_dir_all(parent).await;
-        }
+            if let Some(parent) = thumb_full_path.parent() {
+                let _ = tokio::fs::create_dir_all(parent).await;
+            }
 
-        let thumb_result = ffmpeg_extract_thumbnail(
-            &input_path_str,
-            &thumb_full_path.to_string_lossy(),
-        )
-        .await;
+            let thumb_result = ffmpeg_extract_thumbnail(
+                &input_path_str,
+                &thumb_full_path.to_string_lossy(),
+            )
+            .await;
 
-        let final_thumb = if thumb_result.is_ok() {
-            tracing::info!(%batch_id, item_id, %filename, "Thumbnail extracted successfully");
-            Some(thumb_relative)
+            if let Some(parent) = thumb_full_path.parent() {
+                let _ = tokio::fs::create_dir_all(parent).await;
+            }
+
+            if thumb_result.is_ok() {
+                tracing::info!(%batch_id, item_id, %filename, "Thumbnail extracted successfully");
+                Some(thumb_relative)
+            } else {
+                tracing::warn!(%batch_id, item_id, %filename, "Thumbnail extraction failed: {:?}", thumb_result.err());
+                None
+            }
         } else {
-            tracing::warn!(%batch_id, item_id, %filename, "Thumbnail extraction failed: {:?}", thumb_result.err());
+            tracing::info!(%batch_id, item_id, "Skipping FFmpeg thumbnail extraction (custom thumbnail provided)");
             None
         };
 
@@ -430,14 +443,19 @@ pub fn spawn_background_processing(
 
         // Step 3: Update database
         if final_thumb.is_some() || is_web_safe_video(&extension) {
-            let _ = sqlx::query(
+            // When custom thumbnail exists, don't overwrite it (COALESCE keeps existing thumbnail_path)
+            let query_str = if thumbnail_is_custom {
+                "UPDATE videos SET status = 'active', thumbnail_path = COALESCE(thumbnail_path, ?), transcoded_path = ?, processing_progress = 100 WHERE id = ?"
+            } else {
                 "UPDATE videos SET status = 'active', thumbnail_path = ?, transcoded_path = ?, processing_progress = 100 WHERE id = ?"
-            )
-            .bind(&final_thumb)
-            .bind(&final_transcoded)
-            .bind(item_id)
-            .execute(&db_pool)
-            .await;
+            };
+            
+            let _ = sqlx::query(query_str)
+                .bind(&final_thumb)
+                .bind(&final_transcoded)
+                .bind(item_id)
+                .execute(&db_pool)
+                .await;
 
             tracing::info!(%batch_id, item_id, "Video activated");
         } else {
@@ -457,8 +475,8 @@ pub fn spawn_background_processing(
 pub async fn resume_processing_on_startup(state: Arc<AppState>) {
     tracing::info!("Checking for unfinished video processing tasks to resume...");
     
-    let pending_videos: Result<Vec<(i32, String, String)>, _> = sqlx::query_as(
-        "SELECT id, stored_path, original_filename FROM videos WHERE status = 'processing'"
+    let pending_videos: Result<Vec<(i32, String, String, bool)>, _> = sqlx::query_as(
+        "SELECT id, stored_path, original_filename, thumbnail_is_custom FROM videos WHERE status = 'processing'"
     )
     .fetch_all(&state.db.pool)
     .await;
@@ -471,9 +489,9 @@ pub async fn resume_processing_on_startup(state: Arc<AppState>) {
             }
             
             tracing::info!("Found {} unfinished video processing tasks. Resuming...", videos.len());
-            for (id, stored_path, filename) in videos {
+            for (id, stored_path, filename, thumbnail_is_custom) in videos {
                 tracing::info!(id, %filename, "Resuming background processing for video");
-                spawn_background_processing(state.clone(), id, stored_path, filename);
+                spawn_background_processing(state.clone(), id, stored_path, filename, thumbnail_is_custom);
             }
         }
         Err(e) => {
@@ -610,7 +628,7 @@ async fn list_pinned_videos(
     }
 }
 
-// POST /video — Upload video file(s) with streaming to disk
+// POST /video — Upload video file (single file only) with optional custom thumbnail
 async fn upload_video(
     Extension(auth_user): Extension<AuthUser>,
     State(state): State<Arc<AppState>>,
@@ -623,17 +641,9 @@ async fn upload_video(
     let mut title: Option<String> = None;
     let mut description: Option<String> = None;
     let mut visibility = "private".to_string();
-
-    // Struct to hold saved file info before DB insert
-    struct SavedFile {
-        original_filename: String,
-        stored_path: String,
-        full_path: std::path::PathBuf,
-        size_bytes: u64,
-        mime_type: &'static str,
-    }
-
-    let mut saved_files: Vec<SavedFile> = Vec::new();
+    let mut file_data: Option<(String, PathBuf, String, u64, &'static str)> = None; // (filename, full_path, stored_path, size, mime_type)
+    let mut thumbnail_data: Option<Vec<u8>> = None;
+    let mut thumbnail_filename: Option<String> = None;
 
     // Parse multipart fields — stream file chunks directly to disk
     while let Ok(Some(mut field)) = multipart.next_field().await {
@@ -662,6 +672,17 @@ async fn upload_video(
                 }
             }
             "file" => {
+                // Reject second file field
+                if file_data.is_some() {
+                    if let Some((_, path, _, _, _)) = &file_data {
+                        let _ = tokio::fs::remove_file(path).await;
+                    }
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(ApiResponse::error("Only one video file is allowed per upload.")),
+                    );
+                }
+
                 let orig_filename = match field.file_name().map(|s| s.to_string()) {
                     Some(name) if !name.is_empty() => name,
                     _ => continue,
@@ -671,24 +692,9 @@ async fn upload_video(
                 let extension = match validate_extension(MediaType::Video, &orig_filename) {
                     Ok(ext) => ext,
                     Err(msg) => {
-                        // Cleanup already-saved files on validation error
-                        for sf in &saved_files {
-                            let _ = tokio::fs::remove_file(&sf.full_path).await;
-                        }
                         return (StatusCode::BAD_REQUEST, Json(ApiResponse::error(msg)));
                     }
                 };
-
-                // Enforce bulk upload limit (max 5 files)
-                if saved_files.len() >= 5 {
-                    for sf in &saved_files {
-                        let _ = tokio::fs::remove_file(&sf.full_path).await;
-                    }
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(ApiResponse::error("Too many files. Limit is 5 video files per upload.")),
-                    );
-                }
 
                 // Generate storage path and stream to disk
                 let (stored_path, full_path) =
@@ -698,9 +704,6 @@ async fn upload_video(
                     Ok(size) => size,
                     Err(e) => {
                         tracing::error!("Failed to stream file to disk: {}", e);
-                        for sf in &saved_files {
-                            let _ = tokio::fs::remove_file(&sf.full_path).await;
-                        }
                         return (
                             StatusCode::INTERNAL_SERVER_ERROR,
                             Json(ApiResponse::error("Failed to save file to disk")),
@@ -714,34 +717,79 @@ async fn upload_video(
                 }
 
                 let mime_type = MediaType::Video.mime_type_for_extension(&extension);
-
-                saved_files.push(SavedFile {
-                    original_filename: orig_filename,
-                    stored_path,
-                    full_path,
-                    size_bytes,
-                    mime_type,
-                });
+                file_data = Some((orig_filename, full_path, stored_path, size_bytes, mime_type));
+            }
+            "thumbnail" => {
+                let filename = field.file_name().map(|s| s.to_string());
+                if let Ok(bytes) = field.bytes().await {
+                    if !bytes.is_empty() {
+                        thumbnail_data = Some(bytes.to_vec());
+                        thumbnail_filename = filename;
+                    }
+                }
             }
             _ => {}
         }
     }
 
-    if saved_files.is_empty() {
-        return (StatusCode::BAD_REQUEST, Json(ApiResponse::error("No file provided")));
+    let (orig_filename, full_path, stored_path, size_bytes, mime_type) = match file_data {
+        Some(data) => data,
+        None => {
+            return (StatusCode::BAD_REQUEST, Json(ApiResponse::error("No file provided")));
+        }
+    };
+
+    tracing::info!(%batch_id, "Starting single video upload with background processing");
+
+    // ── PHASE 1: Process optional thumbnail ──────────────────────────────────
+    let mut thumbnail_path: Option<String> = None;
+    let mut thumbnail_is_custom = false;
+
+    if let (Some(thumb_bytes), Some(thumb_filename)) = (thumbnail_data, thumbnail_filename) {
+        if let Err(msg) = validate_thumbnail(&thumb_filename, thumb_bytes.len()) {
+            tracing::warn!("Skipping custom video thumbnail: {}", msg);
+        } else {
+            // Generate thumbnail synchronously (it's a fast image resize, not FFmpeg)
+            let generated_thumb_path = generate_thumbnail_path(&stored_path);
+            let thumb_full_path = std::path::PathBuf::from(&state.config.storage_dir)
+                .join(&generated_thumb_path);
+
+            let permit = state.image_semaphore.clone().acquire_owned().await;
+            if let Ok(_permit) = permit {
+                let thumb_result =
+                    tokio::task::spawn_blocking(move || generate_thumbnail_only(&thumb_bytes))
+                        .await;
+
+                match thumb_result {
+                    Ok(Ok(webp_bytes)) => {
+                        if let Err(e) = crate::media::save_file(&thumb_full_path, &webp_bytes).await {
+                            tracing::warn!("Failed to save video thumbnail: {}", e);
+                        } else {
+                            thumbnail_path = Some(generated_thumb_path);
+                            thumbnail_is_custom = true;
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!("Failed to generate video thumbnail: {}", e);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Thumbnail generation task panicked: {}", e);
+                    }
+                }
+            } else {
+                tracing::warn!("Image semaphore closed, skipping video thumbnail generation");
+            }
+        }
     }
 
-    let num_files = saved_files.len();
-    tracing::info!(%batch_id, file_count = num_files, "Starting video upload with background processing");
-
-    // ── PHASE 1: Save metadata to DB (fast) ──────────────────────────────────
-    let mut uploaded_items: Vec<VideoItem> = Vec::new();
+    // ── PHASE 2: Save metadata to DB ─────────────────────────────────────────
     let mut tx = match state.db.pool.begin().await {
         Ok(tx) => tx,
         Err(e) => {
             tracing::error!("Failed to start transaction: {:?}", e);
-            for sf in &saved_files {
-                let _ = tokio::fs::remove_file(&sf.full_path).await;
+            let _ = tokio::fs::remove_file(&full_path).await;
+            if let Some(tp) = &thumbnail_path {
+                let _ = delete_file(&state.config.storage_dir, tp).await;
             }
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -750,115 +798,111 @@ async fn upload_video(
         }
     };
 
-    for sf in &saved_files {
-        let item_title = if num_files == 1 && title.is_some() {
-            title.clone().unwrap()
-        } else {
-            sf.original_filename.clone()
-        };
+    let item_title = title.unwrap_or_else(|| orig_filename.clone());
 
-        // Generate unique short_id
-        let short_id = loop {
-            let candidate = generate_short_id();
-            let exists: Result<Option<(i32,)>, _> =
-                sqlx::query_as("SELECT id FROM videos WHERE short_id = ?")
-                    .bind(&candidate)
-                    .fetch_optional(&mut *tx)
-                    .await;
+    // Generate unique short_id
+    let short_id = loop {
+        let candidate = generate_short_id();
+        let exists: Result<Option<(i32,)>, _> =
+            sqlx::query_as("SELECT id FROM videos WHERE short_id = ?")
+                .bind(&candidate)
+                .fetch_optional(&mut *tx)
+                .await;
 
-            match exists {
-                Ok(None) => break candidate,
-                Ok(Some(_)) => continue,
-                Err(e) => {
-                    tracing::error!("Failed to check short_id uniqueness: {}", e);
-                    for sf2 in &saved_files {
-                        let _ = tokio::fs::remove_file(&sf2.full_path).await;
-                    }
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(ApiResponse::error("Failed to generate unique short_id")),
-                    );
-                }
-            }
-        };
-
-        let result = sqlx::query(
-            "INSERT INTO videos (user_id, title, description, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'processing')",
-        )
-        .bind(auth_user.id)
-        .bind(&item_title)
-        .bind(&description)
-        .bind(&sf.original_filename)
-        .bind(&sf.stored_path)
-        .bind(sf.size_bytes as i64)
-        .bind(sf.mime_type)
-        .bind(&visibility)
-        .bind(&short_id)
-        .execute(&mut *tx)
-        .await;
-
-        match result {
-            Ok(res) => {
-                uploaded_items.push(VideoItem {
-                    id: res.last_insert_id() as i32,
-                    user_id: auth_user.id,
-                    title: item_title,
-                    description: description.clone(),
-                    original_filename: sf.original_filename.clone(),
-                    stored_path: sf.stored_path.clone(),
-                    size_bytes: sf.size_bytes as i64,
-                    mime_type: sf.mime_type.to_string(),
-                    visibility: visibility.clone(),
-                    short_id,
-                    thumbnail_path: None,
-                    transcoded_path: None,
-                    pinned: false,
-                    status: "processing".to_string(),
-                    processing_progress: 0,
-                    pin_order: 0,
-                    created_at: DateTime::from(Utc::now()),
-                });
-            }
+        match exists {
+            Ok(None) => break candidate,
+            Ok(Some(_)) => continue,
             Err(e) => {
-                tracing::error!("Failed to insert video item: {}", e);
-                for sf2 in &saved_files {
-                    let _ = tokio::fs::remove_file(&sf2.full_path).await;
+                tracing::error!("Failed to check short_id uniqueness: {}", e);
+                let _ = tokio::fs::remove_file(&full_path).await;
+                if let Some(tp) = &thumbnail_path {
+                    let _ = delete_file(&state.config.storage_dir, tp).await;
                 }
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ApiResponse::error("Failed to save video metadata")),
+                    Json(ApiResponse::error("Failed to generate unique short_id")),
                 );
             }
         }
-    }
+    };
 
-    if let Err(e) = tx.commit().await {
-        tracing::error!("Failed to commit transaction: {:?}", e);
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiResponse::error("Failed to commit database transaction")),
-        );
-    }
+    let result = sqlx::query(
+        "INSERT INTO videos (user_id, title, description, original_filename, stored_path, size_bytes, mime_type, visibility, short_id, status, thumbnail_path, thumbnail_is_custom) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'processing', ?, ?)",
+    )
+    .bind(auth_user.id)
+    .bind(&item_title)
+    .bind(&description)
+    .bind(&orig_filename)
+    .bind(&stored_path)
+    .bind(size_bytes as i64)
+    .bind(mime_type)
+    .bind(&visibility)
+    .bind(&short_id)
+    .bind(&thumbnail_path)
+    .bind(thumbnail_is_custom)
+    .execute(&mut *tx)
+    .await;
 
-    tracing::info!(%batch_id, total_uploaded = uploaded_items.len(), "Raw video files saved, spawning FFmpeg background processing");
+    let video_id = match result {
+        Ok(res) => {
+            if let Err(e) = tx.commit().await {
+                tracing::error!("Failed to commit transaction: {:?}", e);
+                let _ = tokio::fs::remove_file(&full_path).await;
+                if let Some(tp) = &thumbnail_path {
+                    let _ = delete_file(&state.config.storage_dir, tp).await;
+                }
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ApiResponse::error("Failed to commit database transaction")),
+                );
+            }
+            res.last_insert_id() as i32
+        }
+        Err(e) => {
+            tracing::error!("Failed to insert video item: {}", e);
+            let _ = tokio::fs::remove_file(&full_path).await;
+            if let Some(tp) = &thumbnail_path {
+                let _ = delete_file(&state.config.storage_dir, tp).await;
+            }
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::error("Failed to save video metadata")),
+            );
+        }
+    };
 
-    // ── PHASE 2: Spawn background FFmpeg processing ──────────────────────────
-    for item in &uploaded_items {
-        spawn_background_processing(
-            state.clone(),
-            item.id,
-            item.stored_path.clone(),
-            item.original_filename.clone(),
-        );
-    }
+    // ── PHASE 3: Spawn background FFmpeg processing ──────────────────────────
+    spawn_background_processing(
+        state.clone(),
+        video_id,
+        stored_path.clone(),
+        orig_filename.clone(),
+        thumbnail_is_custom,
+    );
 
-    // ── PHASE 3: Return 202 Accepted immediately ─────────────────────────────
-    if num_files == 1 {
-        let single_item = uploaded_items.into_iter().next().unwrap();
-        (StatusCode::ACCEPTED, Json(ApiResponse::success(UploadResponse::Single(single_item))))
-    } else {
-        (StatusCode::ACCEPTED, Json(ApiResponse::success(UploadResponse::Bulk(uploaded_items))))
-    }
+    // ── PHASE 4: Return 202 Accepted ────────────────────────────────────────
+    let item = VideoItem {
+        id: video_id,
+        user_id: auth_user.id,
+        title: item_title,
+        description,
+        original_filename: orig_filename,
+        stored_path,
+        size_bytes: size_bytes as i64,
+        mime_type: mime_type.to_string(),
+        visibility,
+        short_id,
+        thumbnail_path,
+        transcoded_path: None,
+        pinned: false,
+        status: "processing".to_string(),
+        processing_progress: 0,
+        pin_order: 0,
+        thumbnail_is_custom,
+        created_at: DateTime::from(Utc::now()),
+    };
+
+    (StatusCode::ACCEPTED, Json(ApiResponse::success(UploadResponse::Single(item))))
 }
 
 // POST /video/status — Check processing status of multiple videos
@@ -1847,6 +1891,7 @@ async fn reprocess_video(
         item.id,
         item.stored_path.clone(),
         item.original_filename.clone(),
+        item.thumbnail_is_custom,
     );
 
     let mut response_item = item;
@@ -1854,4 +1899,153 @@ async fn reprocess_video(
     response_item.processing_progress = 0;
 
     (StatusCode::ACCEPTED, Json(ApiResponse::success(response_item)))
+}
+
+// PUT /video/{id}/thumbnail — Replace a video's thumbnail
+async fn replace_video_thumbnail(
+    Extension(auth_user): Extension<AuthUser>,
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i32>,
+    mut multipart: Multipart,
+) -> (StatusCode, Json<ApiResponse<VideoItem>>) {
+    // Fetch video by id
+    let item: Result<VideoItem, _> = sqlx::query_as(&format!(
+        "SELECT {} FROM videos WHERE id = ?",
+        VIDEO_COLUMNS
+    ))
+    .bind(id)
+    .fetch_one(&state.db.pool)
+    .await;
+
+    let item = match item {
+        Ok(item) => item,
+        Err(_) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ApiResponse::error("Video not found")),
+            );
+        }
+    };
+
+    // Ownership check
+    if item.user_id != auth_user.id && !auth_user.is_superuser() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(ApiResponse::error("You can only update your own videos")),
+        );
+    }
+
+    // Extract thumbnail field from multipart
+    let mut thumbnail_data: Option<Vec<u8>> = None;
+    let mut thumbnail_filename: Option<String> = None;
+
+    while let Ok(Some(field)) = multipart.next_field().await {
+        let field_name = field.name().unwrap_or("").to_string();
+        if field_name == "thumbnail" {
+            let filename = field.file_name().map(|s| s.to_string());
+            if let Ok(bytes) = field.bytes().await {
+                if !bytes.is_empty() {
+                    thumbnail_data = Some(bytes.to_vec());
+                    thumbnail_filename = filename;
+                }
+            }
+            break; // Only process first thumbnail field
+        }
+    }
+
+    let (thumb_bytes, thumb_filename) = match (thumbnail_data, thumbnail_filename) {
+        (Some(data), Some(filename)) => (data, filename),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiResponse::error("No thumbnail provided")),
+            );
+        }
+    };
+
+    // Validate thumbnail
+    if let Err(msg) = validate_thumbnail(&thumb_filename, thumb_bytes.len()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::error(msg)),
+        );
+    }
+
+    // Generate thumbnail image
+    let generated_thumb_path = generate_thumbnail_path(&item.stored_path);
+    let thumb_full_path = PathBuf::from(&state.config.storage_dir).join(&generated_thumb_path);
+
+    let permit = state.image_semaphore.clone().acquire_owned().await;
+    if let Err(_) = permit {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse::error("Image processing semaphore closed")),
+        );
+    }
+
+    let thumb_result = tokio::task::spawn_blocking(move || generate_thumbnail_only(&thumb_bytes))
+        .await;
+
+    let webp_bytes = match thumb_result {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(e)) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiResponse::error(&format!("Failed to generate thumbnail: {}", e))),
+            );
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::error(&format!("Thumbnail generation panicked: {}", e))),
+            );
+        }
+    };
+
+    // Delete old thumbnail if it exists
+    if let Some(old_path) = &item.thumbnail_path {
+        let _ = delete_file(&state.config.storage_dir, old_path).await;
+    }
+
+    // Save new thumbnail
+    if let Err(e) = crate::media::save_file(&thumb_full_path, &webp_bytes).await {
+        tracing::error!("Failed to save video thumbnail: {}", e);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse::error("Failed to save thumbnail")),
+        );
+    }
+
+    // Update database
+    if let Err(e) = sqlx::query(
+        "UPDATE videos SET thumbnail_path = ?, thumbnail_is_custom = TRUE WHERE id = ?"
+    )
+    .bind(&generated_thumb_path)
+    .bind(id)
+    .execute(&state.db.pool)
+    .await
+    {
+        tracing::error!("Failed to update video thumbnail: {}", e);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse::error("Failed to update video")),
+        );
+    }
+
+    // Fetch and return updated item
+    let updated: Result<VideoItem, _> = sqlx::query_as(&format!(
+        "SELECT {} FROM videos WHERE id = ?",
+        VIDEO_COLUMNS
+    ))
+    .bind(id)
+    .fetch_one(&state.db.pool)
+    .await;
+
+    match updated {
+        Ok(item) => (StatusCode::OK, Json(ApiResponse::success(item))),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse::error("Failed to fetch updated video")),
+        ),
+    }
 }
