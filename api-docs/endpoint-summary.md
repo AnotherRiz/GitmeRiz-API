@@ -47,17 +47,18 @@
 | POST | `/video/{id}/reprocess` | Yes | Retry FFmpeg thumbnail + transcoding - returns `202`, processes in background (owner / superuser) |
 | DELETE | `/video/{id}` | Yes | Delete video + all files (original, transcoded, thumbnail) (owner / superuser) |
 | GET | `/audio/public` | No | List all public audio items |
-| GET | `/audio` | Yes | List audio (own / all for superuser) |
+| GET | `/audio/me` | Yes | List audio (own / all for superuser) with cursor pagination - supports `?cursor={id}&limit=50` |
 | POST | `/audio` | Yes | Upload audio (multipart, no size limit); supports title/description/visibility/thumbnail (all optional except file); `.aac` auto-remuxed to `.m4a` |
 | GET | `/audio/{id}` | Optional | Get audio metadata by id (public: no auth, private: cookie/header) |
-| GET | `/audio/{id}/download` | Optional | Download audio file with attachment header (public: no auth, private: cookie/header) |
+| GET | `/audio/d/{id}` | Optional | Download audio file with attachment header by numeric id (public: no auth, private: cookie/header) |
 | GET | `/audio/{id}/thumbnail` | Optional | Serve cover art thumbnail inline, WebP cached 1 year (public: no auth, private: cookie/header) |
+| GET | `/audio/t/{short_id}` | Optional | Serve cover art thumbnail by short_id inline, WebP cached 1 year (public: no auth, private: cookie/header) |
 | PATCH | `/audio/{id}` | Yes | Unified partial update: title/description/visibility/pinned (owner / superuser, max 8 pinned per user) |
 | GET | `/audio/me/pinned` | Yes | List current user's pinned audio (no pagination, max 8) |
 | PATCH | `/audio/reorder-pins` | Yes | Persist custom order for pinned audio (drag-and-drop support, max 8) |
 | GET | `/audio/info/{short_id}` | Optional | Get audio metadata by short_id (public: no auth, private: cookie/header) |
 | GET | `/audio/download/{short_id}` | Optional | Download audio file by short_id with attachment header (public: no auth, private: cookie/header) |
-| GET | `/audio/thumb/{short_id}` | Optional | Serve cover art thumbnail by short_id inline, WebP cached 1 year (public: no auth, private: cookie/header) |
+| GET | `/audio/r/{short_id}` | Optional | Stream audio inline with HTTP 206 Range support (public: no auth, private: cookie/header) |
 | POST | `/audio/{id}/thumbnails` | Yes | Add multiple thumbnail images (multipart, up to 20 per audio, 5 MB max each) (owner / superuser) |
 | GET | `/audio/{id}/thumbnails` | Yes | List all thumbnails for an audio item (owner / superuser) |
 | GET | `/audio/{id}/thumbnails/{thumbnail_id}` | No | Serve a specific thumbnail image inline (WebP, cached 1 year) |
