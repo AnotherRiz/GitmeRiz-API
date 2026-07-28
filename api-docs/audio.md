@@ -19,7 +19,7 @@ private items require authentication and ownership. Upload and deletion require 
 - Resized to a WebP thumbnail (max 500px width, quality 80, never upscaled).
 - If thumbnail processing fails for any reason, the audio upload still succeeds without a thumbnail
   (non-fatal — check `thumbnail_path` in the response to see if one was generated).
-- Served inline via `GET /audio/{id}/thumbnail` (same visibility access rules as the audio item itself).
+- Served inline via `GET /audio/cover/t/{short_id_cover}` (same visibility access rules as the audio item itself).
 
 **Format handling:**
 | Extension | Behavior |
@@ -521,7 +521,7 @@ Each thumbnail entry includes:
 
 ---
 
-## POST /audio/{id}/thumbnails
+## POST /audio/{id}/cover
 
 Adds one or more cover images to an audio item (up to 20 total per item). Requires authentication. Owner or `superuser` only. Uses `multipart/form-data`.
 
@@ -576,19 +576,19 @@ Errors:
 
 ```bash
 # Add a single cover image
-curl -X POST http://localhost:3000/api/audio/5/thumbnails \
+curl -X POST http://localhost:3000/api/audio/5/cover \
   -H "Authorization: Bearer <token>" \
   -F "thumbnails=@cover1.jpg"
 
 # Add multiple cover images at once
-curl -X POST http://localhost:3000/api/audio/5/thumbnails \
+curl -X POST http://localhost:3000/api/audio/5/cover \
   -H "Authorization: Bearer <token>" \
   -F "thumbnails=@cover1.jpg" \
   -F "thumbnails=@cover2.png" \
   -F "thumbnails=@cover3.webp"
 ```
 
-## GET /audio/{id}/thumbnails
+## GET /audio/{id}/cover
 
 Lists all cover images for an audio item, ordered by `sort_order` ascending, then by `id` ascending. Requires authentication. Owner or `superuser` only.
 
@@ -631,7 +631,74 @@ Errors:
 - `500` — database error.
 
 ```bash
-curl http://localhost:3000/api/audio/5/thumbnails \
+curl http://localhost:3000/api/audio/5/cover \
+  -H "Authorization: Bearer <token>"
+```
+
+## PATCH /audio/{id}/cover
+
+Sets a specific cover image as primary (replaces the currently-displayed cover art). Requires authentication. Owner or `superuser` only.
+
+**Request body:**
+```json
+{
+  "short_id": "CvR8Kx1P"
+}
+```
+
+Response `200`:
+```json
+{
+  "success": true,
+  "data": "Primary cover updated"
+}
+```
+
+**Behavior:**
+- Unsets all other cover images from primary status (`is_primary = false`).
+- Updates `audio.thumbnail_path` to point to this cover image **only if the cover's `status` is `active`** (skips if still `processing`).
+- If the cover is still processing, `audio.thumbnail_path` remains unchanged until the cover becomes `active`.
+
+Errors:
+- `400` — `short_id` field missing or empty.
+- `403` — authenticated user does not own the audio.
+- `404` — audio or cover image not found.
+- `500` — database error.
+
+```bash
+curl -X PATCH http://localhost:3000/api/audio/5/cover \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{"short_id": "CvR8Kx1P"}'
+```
+
+## DELETE /audio/{id}/cover
+
+Deletes a specific cover image and all associated files (raw, thumbnail, preview). Requires authentication. Owner or `superuser` only.
+
+**Query Parameters:**
+- `short_id` (required): The short_id of the cover image to delete.
+
+Response `200`:
+```json
+{
+  "success": true,
+  "data": "Cover image deleted"
+}
+```
+
+**Behavior:**
+- If the deleted cover was primary, the next cover (in `sort_order` order) is automatically promoted to primary **only if its status is `active`** (skips if still `processing`).
+- If this was the last cover or no active covers remain, `audio.thumbnail_path` is cleared to `NULL`.
+
+Errors:
+- `400` — `short_id` query parameter missing.
+- `403` — authenticated user does not own the audio.
+- `404` — audio or cover image not found.
+- `500` — database or file system error.
+
+```bash
+curl -X DELETE "http://localhost:3000/api/audio/5/cover?short_id=CvR8Kx1P" \
   -H "Authorization: Bearer <token>"
 ```
 
@@ -738,57 +805,4 @@ Errors:
 curl http://localhost:3000/api/audio/AbC12XyZ/cover/CvR8Kx1P
 ```
 
-## PATCH /audio/{id}/thumbnails/{thumbnail_id}
 
-Sets a specific cover image as primary (replaces the currently-displayed cover art). Requires authentication. Owner or `superuser` only.
-
-**Request body:** (empty or no body required)
-
-Response `200`:
-```json
-{
-  "success": true,
-  "data": "Primary cover updated"
-}
-```
-
-**Behavior:**
-- Unsets all other cover images from primary status (`is_primary = false`).
-- Updates `audio.thumbnail_path` to point to this cover image **only if the cover's `status` is `active`** (skips if still `processing`).
-- If the cover is still processing, `audio.thumbnail_path` remains unchanged until the cover becomes `active`.
-
-Errors:
-- `403` — authenticated user does not own the audio.
-- `404` — audio or cover image not found.
-- `500` — database error.
-
-```bash
-curl -X PATCH http://localhost:3000/api/audio/5/thumbnails/2 \
-  -H "Authorization: Bearer <token>"
-```
-
-## DELETE /audio/{id}/thumbnails/{thumbnail_id}
-
-Deletes a specific cover image and all associated files (raw, thumbnail, preview). Requires authentication. Owner or `superuser` only.
-
-Response `200`:
-```json
-{
-  "success": true,
-  "data": "Cover image deleted"
-}
-```
-
-**Behavior:**
-- If the deleted cover was primary, the next cover (in `sort_order` order) is automatically promoted to primary **only if its status is `active`** (skips if still `processing`).
-- If this was the last cover or no active covers remain, `audio.thumbnail_path` is cleared to `NULL`.
-
-Errors:
-- `403` — authenticated user does not own the audio.
-- `404` — audio or cover image not found.
-- `500` — database or file system error.
-
-```bash
-curl -X DELETE http://localhost:3000/api/audio/5/thumbnails/2 \
-  -H "Authorization: Bearer <token>"
-```

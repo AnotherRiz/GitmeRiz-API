@@ -71,6 +71,11 @@ pub struct CoverThumbnailQuery {
     pub primary: Option<bool>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct SetPrimaryCoverRequest {
+    pub short_id: String,
+}
+
 #[derive(Debug, FromRow, Serialize, Clone)]
 pub struct AudioThumbnail {
     pub id: i32,
@@ -112,8 +117,7 @@ pub fn protected_routes() -> Router<Arc<AppState>> {
         .route("/audio/{id}", patch(update_audio).delete(delete_audio))
         .route("/audio/me/pinned", get(list_pinned_audio))
         .route("/audio/reorder-pins", patch(reorder_audio_pins))
-        .route("/audio/{id}/thumbnails", post(add_audio_thumbnails).get(list_audio_thumbnails))
-        .route("/audio/{id}/thumbnails/{thumbnail_id}", patch(set_primary_audio_thumbnail).delete(delete_audio_thumbnail))
+        .route("/audio/{id}/cover", post(add_audio_thumbnails).get(list_audio_thumbnails).patch(set_primary_audio_thumbnail).delete(delete_audio_thumbnail))
 }
 
 // ─── Helpers ───────────────────────────────────────────────────────────────────
@@ -1820,7 +1824,8 @@ async fn get_audio_cover_scoped(
 async fn set_primary_audio_thumbnail(
     Extension(auth_user): Extension<AuthUser>,
     State(state): State<Arc<AppState>>,
-    Path((id, thumbnail_id)): Path<(i32, i32)>,
+    Path(id): Path<i32>,
+    Json(req): Json<SetPrimaryCoverRequest>,
 ) -> (StatusCode, Json<ApiResponse<String>>) {
     // Verify audio belongs to user
     let audio_item: Result<AudioItem, _> = sqlx::query_as(&format!(
@@ -1844,25 +1849,25 @@ async fn set_primary_audio_thumbnail(
     if audio_item.user_id != auth_user.id && !auth_user.is_superuser() {
         return (
             StatusCode::FORBIDDEN,
-            Json(ApiResponse::error("You can only modify your own audio thumbnails")),
+            Json(ApiResponse::error("You can only modify your own audio covers")),
         );
     }
 
-    // Verify thumbnail belongs to this audio and get its thumbnail_path and status
-    let thumbnail: Result<(Option<String>,), _> = sqlx::query_as(
-        "SELECT thumbnail_path FROM audio_thumbnails WHERE id = ? AND audio_id = ?"
+    // Verify cover image belongs to this audio and get its numeric id, thumbnail_path and status
+    let thumbnail: Result<(i32, Option<String>), _> = sqlx::query_as(
+        "SELECT id, thumbnail_path FROM audio_thumbnails WHERE short_id = ? AND audio_id = ?"
     )
-    .bind(thumbnail_id)
+    .bind(&req.short_id)
     .bind(id)
     .fetch_one(&state.db.pool)
     .await;
 
-    let (thumbnail_path,) = match thumbnail {
+    let (thumbnail_id, thumbnail_path) = match thumbnail {
         Ok(t) => t,
         Err(_) => {
             return (
                 StatusCode::NOT_FOUND,
-                Json(ApiResponse::error("Thumbnail not found")),
+                Json(ApiResponse::error("Cover image not found")),
             );
         }
     };
@@ -1874,12 +1879,12 @@ async fn set_primary_audio_thumbnail(
             tracing::error!("Failed to start transaction: {}", e);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiResponse::error("Failed to update primary thumbnail")),
+                Json(ApiResponse::error("Failed to update primary cover")),
             );
         }
     };
 
-    // Unset all other thumbnails as primary for this audio
+    // Unset all other covers as primary for this audio
     if let Err(e) = sqlx::query("UPDATE audio_thumbnails SET is_primary = FALSE WHERE audio_id = ? AND id != ?")
         .bind(id)
         .bind(thumbnail_id)
@@ -1887,28 +1892,28 @@ async fn set_primary_audio_thumbnail(
         .await
     {
         let _ = tx.rollback().await;
-        tracing::error!("Failed to unset other thumbnails: {}", e);
+        tracing::error!("Failed to unset other covers: {}", e);
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiResponse::error("Failed to update primary thumbnail")),
+            Json(ApiResponse::error("Failed to update primary cover")),
         );
     }
 
-    // Set this thumbnail as primary
+    // Set this cover as primary
     if let Err(e) = sqlx::query("UPDATE audio_thumbnails SET is_primary = TRUE WHERE id = ?")
         .bind(thumbnail_id)
         .execute(&mut *tx)
         .await
     {
         let _ = tx.rollback().await;
-        tracing::error!("Failed to set primary thumbnail: {}", e);
+        tracing::error!("Failed to set primary cover: {}", e);
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiResponse::error("Failed to update primary thumbnail")),
+            Json(ApiResponse::error("Failed to update primary cover")),
         );
     }
 
-    // Update audio.thumbnail_path to point to this thumbnail ONLY if it's been processed (thumbnail_path is not NULL)
+    // Update audio.thumbnail_path to point to this cover ONLY if it's been processed (thumbnail_path is not NULL)
     // Skip mirroring if still processing (thumbnail_path = NULL) to avoid writing NULL over a working thumbnail
     if let Some(path) = thumbnail_path {
         if let Err(e) = sqlx::query("UPDATE audio SET thumbnail_path = ? WHERE id = ?")
@@ -1921,7 +1926,7 @@ async fn set_primary_audio_thumbnail(
             tracing::error!("Failed to update audio thumbnail_path: {}", e);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiResponse::error("Failed to update primary thumbnail")),
+                Json(ApiResponse::error("Failed to update primary cover")),
             );
         }
     } else {
@@ -1932,13 +1937,13 @@ async fn set_primary_audio_thumbnail(
         tracing::error!("Failed to commit transaction: {}", e);
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiResponse::error("Failed to update primary thumbnail")),
+            Json(ApiResponse::error("Failed to update primary cover")),
         );
     }
 
     (
         StatusCode::OK,
-        Json(ApiResponse::success("Primary thumbnail updated".to_string())),
+        Json(ApiResponse::success("Primary cover updated".to_string())),
     )
 }
 
@@ -1946,8 +1951,20 @@ async fn set_primary_audio_thumbnail(
 async fn delete_audio_thumbnail(
     Extension(auth_user): Extension<AuthUser>,
     State(state): State<Arc<AppState>>,
-    Path((id, thumbnail_id)): Path<(i32, i32)>,
+    Path(id): Path<i32>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> (StatusCode, Json<ApiResponse<String>>) {
+    // Get short_id from query parameter
+    let short_id_cover = match params.get("short_id") {
+        Some(sid) => sid.clone(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiResponse::error("Missing query parameter: short_id")),
+            );
+        }
+    };
+
     // Verify audio belongs to user
     let audio_item: Result<AudioItem, _> = sqlx::query_as(&format!(
         "SELECT {} FROM audio WHERE id = ?",
@@ -1970,25 +1987,25 @@ async fn delete_audio_thumbnail(
     if audio_item.user_id != auth_user.id && !auth_user.is_superuser() {
         return (
             StatusCode::FORBIDDEN,
-            Json(ApiResponse::error("You can only delete your own audio thumbnails")),
+            Json(ApiResponse::error("You can only delete your own audio covers")),
         );
     }
 
-    // Fetch thumbnail to get paths and is_primary status
-    let thumbnail: Result<(Option<String>, Option<String>, Option<String>, bool), _> = sqlx::query_as(
-        "SELECT raw_path, thumbnail_path, preview_path, is_primary FROM audio_thumbnails WHERE id = ? AND audio_id = ?"
+    // Fetch cover image to get its numeric id, paths and is_primary status
+    let thumbnail: Result<(i32, Option<String>, Option<String>, Option<String>, bool), _> = sqlx::query_as(
+        "SELECT id, raw_path, thumbnail_path, preview_path, is_primary FROM audio_thumbnails WHERE short_id = ? AND audio_id = ?"
     )
-    .bind(thumbnail_id)
+    .bind(&short_id_cover)
     .bind(id)
     .fetch_one(&state.db.pool)
     .await;
 
-    let (raw_path, thumbnail_path, preview_path, is_primary) = match thumbnail {
+    let (thumbnail_id, raw_path, thumbnail_path, preview_path, is_primary) = match thumbnail {
         Ok(t) => t,
         Err(_) => {
             return (
                 StatusCode::NOT_FOUND,
-                Json(ApiResponse::error("Thumbnail not found")),
+                Json(ApiResponse::error("Cover image not found")),
             );
         }
     };
@@ -2009,16 +2026,16 @@ async fn delete_audio_thumbnail(
             }
             if let Some(path) = &thumbnail_path {
                 if let Err(e) = delete_file(&state.config.storage_dir, path).await {
-                    tracing::warn!("Failed to delete thumbnail file from disk: {}", e);
+                    tracing::warn!("Failed to delete cover thumbnail file from disk: {}", e);
                 }
             }
             if let Some(path) = preview_path {
                 if let Err(e) = delete_file(&state.config.storage_dir, &path).await {
-                    tracing::warn!("Failed to delete preview file from disk: {}", e);
+                    tracing::warn!("Failed to delete cover preview file from disk: {}", e);
                 }
             }
 
-            // If this was the primary thumbnail, find the next one and set it as primary
+            // If this was the primary cover, find the next one and set it as primary
             if is_primary {
                 let next_thumbnail: Result<Option<(i32, Option<String>)>, _> = sqlx::query_as(
                     "SELECT id, thumbnail_path FROM audio_thumbnails WHERE audio_id = ? ORDER BY sort_order ASC LIMIT 1"
@@ -2040,7 +2057,7 @@ async fn delete_audio_thumbnail(
                             .await;
                     }
                 } else {
-                    // No more thumbnails, clear audio.thumbnail_path
+                    // No more covers, clear audio.thumbnail_path
                     let _ = sqlx::query("UPDATE audio SET thumbnail_path = NULL WHERE id = ?")
                         .bind(id)
                         .execute(&state.db.pool)
@@ -2050,12 +2067,12 @@ async fn delete_audio_thumbnail(
 
             (
                 StatusCode::OK,
-                Json(ApiResponse::success("Thumbnail deleted".to_string())),
+                Json(ApiResponse::success("Cover image deleted".to_string())),
             )
         }
         Err(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiResponse::error("Failed to delete thumbnail")),
+            Json(ApiResponse::error("Failed to delete cover image")),
         ),
     }
 }

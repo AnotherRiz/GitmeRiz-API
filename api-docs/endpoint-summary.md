@@ -50,6 +50,7 @@
 | POST | `/audio` | Yes | Upload audio (multipart, no size limit); supports title/description/visibility/thumbnail (all optional except file); `.aac` auto-remuxed to `.m4a` |
 | GET | `/audio/{id}` | Optional | Get audio metadata by id (public: no auth, private: cookie/header) |
 | GET | `/audio/d/{id}` | Optional | Download audio file with attachment header by numeric id (public: no auth, private: cookie/header) |
+| GET | `/audio/cover/{short_id_cover}` | Optional | Serve raw cover image by short_id (original mime type, cached 1 year) (public: no auth, private: cookie/header) |
 | GET | `/audio/cover/t/{short_id_cover}` | Optional | Serve cover thumbnail by short_id (WebP, max 500px, quality 80, cached 1 year); supports `?primary=true` to serve primary cover by audio short_id (public: no auth, private: cookie/header) |
 | GET | `/audio/cover/p/{short_id_cover}` | Optional | Serve cover preview by short_id (WebP, max 1280px, quality 85, cached 1 hour) (public: no auth, private: cookie/header) |
 | GET | `/audio/{short_id_audio}/cover/{short_id_cover}` | Optional | Serve specific cover thumbnail scoped to audio by short_ids (WebP, cached 1 year) (public: no auth, private: cookie/header) |
@@ -58,10 +59,10 @@
 | PATCH | `/audio/reorder-pins` | Yes | Persist custom order for pinned audio (drag-and-drop support, max 8) |
 | GET | `/audio/info/{short_id}` | Optional | Get audio metadata by short_id (public: no auth, private: cookie/header) |
 | GET | `/audio/r/{short_id}` | Optional | Stream audio inline with HTTP 206 Range support (public: no auth, private: cookie/header) |
-| POST | `/audio/{id}/thumbnails` | Yes | Add multiple cover images (multipart, up to 20 per audio, 5 MB max each); returns `202`, processes in background (owner / superuser) |
-| GET | `/audio/{id}/thumbnails` | Yes | List all cover images for an audio item (owner / superuser) |
-| PATCH | `/audio/{id}/thumbnails/{thumbnail_id}` | Yes | Set a cover image as primary (owner / superuser) |
-| DELETE | `/audio/{id}/thumbnails/{thumbnail_id}` | Yes | Delete a specific cover image (owner / superuser) |
+| POST | `/audio/{id}/cover` | Yes | Add multiple cover images (multipart, up to 20 per audio, 5 MB max each); returns `202`, processes in background (owner / superuser) |
+| GET | `/audio/{id}/cover` | Yes | List all cover images for an audio item (owner / superuser) |
+| PATCH | `/audio/{id}/cover` | Yes | Set a cover image as primary (JSON body with short_id field) (owner / superuser) |
+| DELETE | `/audio/{id}/cover` | Yes | Delete a specific cover image (query param: short_id) (owner / superuser) |
 | DELETE | `/audio/{id}` | Yes | Delete audio + file + all thumbnails (owner / superuser) |
 | GET | `/blog` | Yes | List published posts |
 | POST | `/blog` | Yes | Create post (admin / superuser) |
