@@ -443,29 +443,6 @@ Errors:
 curl http://localhost:3000/api/audio/info/AbC12XyZ
 ```
 
-## GET /audio/download/{short_id}
-
-Downloads the actual audio file by `short_id` with `Content-Disposition: attachment` header (public endpoint with visibility check).
-
-**Access rules:**
-- `public` items: no authentication required.
-- `private` items: requires authentication and ownership (or `superuser`).
-
-Errors:
-- `401` — private audio and no authentication provided.
-- `403` — private audio and authenticated user is not the owner (and not `superuser`).
-- `404` — audio not found or file missing on disk.
-
-```bash
-# Download a public audio file by short_id
-curl -o song.mp3 http://localhost:3000/api/audio/download/AbC12XyZ
-
-# Download a private audio file by short_id (with auth)
-curl -o song.mp3 \
-  -H "Authorization: Bearer <token>" \
-  http://localhost:3000/api/audio/download/DeF45GhI
-```
-
 ## GET /audio/r/{short_id}
 
 Streams the audio file inline with HTTP **206 Partial Content** and `Range` header support. Allows the frontend audio player to seek/scrub to any position instantly. Public endpoint with visibility check.
@@ -521,27 +498,57 @@ curl -X DELETE http://localhost:3000/api/audio/1 \
 
 ---
 
-## Audio Thumbnails (Multiple Cover Art Images)
+## Audio Cover Images (Multiple with Async Processing)
 
-Audio items support **multiple cover art thumbnails** (up to 20 per item). One thumbnail is marked as primary and displayed as the audio's cover art. All thumbnail endpoints require authentication.
+Audio items support **multiple cover art images** (up to 20 per item). Each cover image has an **8-character `short_id`** for direct access via URL. One image is marked as primary and mirrored to `audio.thumbnail_path` for display. 
+
+### Async Processing Pipeline
+
+When you upload cover images, they are processed **asynchronously** in the background:
+
+1. **Phase 1 (Synchronous, immediate)**: Files are saved to disk, database rows are inserted with `status = 'processing'`, endpoint returns `202 Accepted` immediately.
+2. **Phase 2 (Background, async)**: A detached `tokio::spawn` task reads each raw image, generates a WebP preview (max 1280px width, quality 85) and thumbnail (max 500px width, quality 80), saves both, and updates the database row to `status = 'active'`.
+
+**Status Values:**
+- `processing` — Image is queued or currently being converted.
+- `active` — Image is ready and both preview and thumbnail files exist on disk.
+- `failed_processing` — Image conversion failed; can be manually retried via `POST /audio/{id}/covers/{short_id}/reprocess` (future endpoint).
+
+### Cover Image Metadata
+
+Each thumbnail entry includes:
+```json
+{
+  "id": 1,
+  "audio_id": 5,
+  "short_id": "CvR8Kx1P",
+  "raw_path": "audio/2026/07/2026-07-22/2026-07-22_14-26-40_UUID.jpg",
+  "thumbnail_path": "audio/2026/07/2026-07-22/2026-07-22_14-26-40_UUID-thumb.webp",
+  "preview_path": "audio/2026/07/2026-07-22/2026-07-22_14-26-40_UUID-preview.webp",
+  "is_primary": true,
+  "sort_order": 0,
+  "status": "active",
+  "created_at": "2026-07-22T14:26:40Z"
+}
+```
 
 ---
 
 ## POST /audio/{id}/thumbnails
 
-Adds one or more thumbnail images to an audio item (up to 20 total per item). Requires authentication. Owner or `superuser` only.
+Adds one or more cover images to an audio item (up to 20 total per item). Requires authentication. Owner or `superuser` only. Uses `multipart/form-data`.
 
 **Constraints:**
-- Max 20 thumbnails per audio item.
-- Each thumbnail: max 5 MB, image extensions (`.jpg`, `.jpeg`, `.png`, `.webp`, `.gif`).
+- Max 20 cover images per audio item.
+- Each image: max 5 MB, image extensions (`.jpg`, `.jpeg`, `.png`, `.webp`, `.gif`).
 - Upload multiple files via repeated `thumbnails` multipart fields.
 
 **Request:** `multipart/form-data`
-- `thumbnails` (repeated) — thumbnail image file(s).
+- `thumbnails` (repeated) — cover image file(s).
 
-If the audio has no primary thumbnail yet, the first successfully-added thumbnail becomes primary.
+If the audio has no primary cover image yet, the first successfully-uploaded image becomes primary.
 
-Response `201`:
+**Response `202 Accepted`** (upload complete; background processing in progress):
 ```json
 {
   "success": true,
@@ -549,17 +556,25 @@ Response `201`:
     {
       "id": 1,
       "audio_id": 5,
-      "thumbnail_path": "audio/2026/07/2026-07-22/2026-07-22_14-26-40_UUID-thumb.webp",
+      "short_id": "CvR8Kx1P",
+      "raw_path": "audio/2026/07/2026-07-22/2026-07-22_14-26-40_UUID.jpg",
+      "thumbnail_path": null,
+      "preview_path": null,
       "is_primary": true,
       "sort_order": 0,
+      "status": "processing",
       "created_at": "2026-07-22T14:26:40Z"
     },
     {
       "id": 2,
       "audio_id": 5,
-      "thumbnail_path": "audio/2026/07/2026-07-22/2026-07-22_14-26-41_UUID-thumb.webp",
+      "short_id": "Thm9Qw2L",
+      "raw_path": "audio/2026/07/2026-07-22/2026-07-22_14-26-41_UUID.png",
+      "thumbnail_path": null,
+      "preview_path": null,
       "is_primary": false,
       "sort_order": 1,
+      "status": "processing",
       "created_at": "2026-07-22T14:26:41Z"
     }
   ]
@@ -567,18 +582,18 @@ Response `201`:
 ```
 
 Errors:
-- `400` — maximum 20 thumbnails reached, or no valid thumbnails were uploaded.
+- `400` — maximum 20 cover images reached, or no valid images were uploaded.
 - `403` — authenticated user does not own the audio.
 - `404` — audio not found.
 - `500` — database or file system error.
 
 ```bash
-# Add a single thumbnail
+# Add a single cover image
 curl -X POST http://localhost:3000/api/audio/5/thumbnails \
   -H "Authorization: Bearer <token>" \
   -F "thumbnails=@cover1.jpg"
 
-# Add multiple thumbnails at once
+# Add multiple cover images at once
 curl -X POST http://localhost:3000/api/audio/5/thumbnails \
   -H "Authorization: Bearer <token>" \
   -F "thumbnails=@cover1.jpg" \
@@ -588,8 +603,7 @@ curl -X POST http://localhost:3000/api/audio/5/thumbnails \
 
 ## GET /audio/{id}/thumbnails
 
-Lists all thumbnail images for an audio item, ordered by `sort_order` ascending, then by `id` ascending.
-Requires authentication. Owner or `superuser` only.
+Lists all cover images for an audio item, ordered by `sort_order` ascending, then by `id` ascending. Requires authentication. Owner or `superuser` only.
 
 Response `200`:
 ```json
@@ -599,17 +613,25 @@ Response `200`:
     {
       "id": 1,
       "audio_id": 5,
+      "short_id": "CvR8Kx1P",
+      "raw_path": "audio/2026/07/2026-07-22/2026-07-22_14-26-40_UUID.jpg",
       "thumbnail_path": "audio/2026/07/2026-07-22/2026-07-22_14-26-40_UUID-thumb.webp",
+      "preview_path": "audio/2026/07/2026-07-22/2026-07-22_14-26-40_UUID-preview.webp",
       "is_primary": true,
       "sort_order": 0,
+      "status": "active",
       "created_at": "2026-07-22T14:26:40Z"
     },
     {
       "id": 2,
       "audio_id": 5,
+      "short_id": "Thm9Qw2L",
+      "raw_path": "audio/2026/07/2026-07-22/2026-07-22_14-26-41_UUID.png",
       "thumbnail_path": "audio/2026/07/2026-07-22/2026-07-22_14-26-41_UUID-thumb.webp",
+      "preview_path": "audio/2026/07/2026-07-22/2026-07-22_14-26-41_UUID-preview.webp",
       "is_primary": false,
       "sort_order": 1,
+      "status": "active",
       "created_at": "2026-07-22T14:26:41Z"
     }
   ]
@@ -626,22 +648,105 @@ curl http://localhost:3000/api/audio/5/thumbnails \
   -H "Authorization: Bearer <token>"
 ```
 
-## GET /audio/{id}/thumbnails/{thumbnail_id}
+## GET /audio/cover/{short_id_cover}
 
-Serves a specific thumbnail image inline (WebP, cached 1 year). Public endpoint.
+Serves the **raw cover image** by cover `short_id` inline. Public endpoint with visibility check. Cached for 1 year.
+
+**Access rules:**
+- Public audio items: no authentication required.
+- Private audio items: requires authentication and ownership (or `superuser`).
+
+**Note:** For legacy cover images (imported from primary thumbnails during migration), the raw image may already be a WebP; newer uploads preserve the original format.
+
+Response `200`: Image data (MIME type varies: `image/jpeg`, `image/png`, `image/webp`, etc.).
+
+Errors:
+- `401` — private audio and no authentication provided.
+- `403` — private audio and authenticated user is not the owner (and not `superuser`).
+- `404` — cover image not found or file missing on disk.
+
+```bash
+# Serve raw cover image (may be different formats: jpg, png, webp, etc.)
+curl -o cover_original.jpg http://localhost:3000/api/audio/cover/CvR8Kx1P
+```
+
+## GET /audio/cover/t/{short_id_cover}
+
+Serves the **thumbnail** (500px max width, WebP, quality 80) by cover `short_id`. Public endpoint with visibility check. Cached for 1 year.
+
+**Access rules:**
+- Public audio items: no authentication required.
+- Private audio items: requires authentication and ownership (or `superuser`).
 
 Response `200`: WebP image data (`Content-Type: image/webp`).
 
 Errors:
-- `404` — thumbnail not found or file missing on disk.
+- `401` — private audio and no authentication provided.
+- `403` — private audio and authenticated user is not the owner (and not `superuser`).
+- `404` — cover image not found, thumbnail not yet generated (still `processing`), or file missing on disk.
 
 ```bash
-curl -o alternate_cover.webp http://localhost:3000/api/audio/5/thumbnails/2
+curl -o cover_thumb.webp http://localhost:3000/api/audio/cover/t/CvR8Kx1P
+```
+
+## GET /audio/cover/p/{short_id_cover}
+
+Serves the **preview** (1280px max width, WebP, quality 85) by cover `short_id`. Public endpoint with visibility check. Cached for 1 hour.
+
+**Access rules:**
+- Public audio items: no authentication required.
+- Private audio items: requires authentication and ownership (or `superuser`).
+
+Response `200`: WebP image data (`Content-Type: image/webp`).
+
+Errors:
+- `401` — private audio and no authentication provided.
+- `403` — private audio and authenticated user is not the owner (and not `superuser`).
+- `404` — cover image not found, preview not yet generated (still `processing`), or file missing on disk.
+
+```bash
+curl -o cover_preview.webp http://localhost:3000/api/audio/cover/p/CvR8Kx1P
+```
+
+## GET /audio/{short_id_audio}/cover/{short_id_cover}
+
+Serves a specific cover image metadata (including raw/thumbnail/preview paths and status). This endpoint validates that the cover image belongs to the specified audio item. Public endpoint with visibility check.
+
+**Access rules:**
+- Public audio items: no authentication required.
+- Private audio items: requires authentication and ownership (or `superuser`).
+
+Response `200`:
+```json
+{
+  "success": true,
+  "data": {
+    "id": 1,
+    "audio_id": 5,
+    "short_id": "CvR8Kx1P",
+    "raw_path": "audio/2026/07/2026-07-22/2026-07-22_14-26-40_UUID.jpg",
+    "thumbnail_path": "audio/2026/07/2026-07-22/2026-07-22_14-26-40_UUID-thumb.webp",
+    "preview_path": "audio/2026/07/2026-07-22/2026-07-22_14-26-40_UUID-preview.webp",
+    "is_primary": true,
+    "sort_order": 0,
+    "status": "active",
+    "created_at": "2026-07-22T14:26:40Z"
+  }
+}
+```
+
+Errors:
+- `401` — private audio and no authentication provided.
+- `403` — private audio and authenticated user is not the owner (and not `superuser`).
+- `404` — audio item not found, or cover image does not belong to specified audio item.
+
+```bash
+curl http://localhost:3000/api/audio/AbC12XyZ/cover/CvR8Kx1P
 ```
 
 ## PATCH /audio/{id}/thumbnails/{thumbnail_id}
 
-Sets a specific thumbnail as primary (replaces the currently-displayed cover art). Requires authentication. Owner or `superuser` only.
+Sets a specific cover image as primary (replaces the currently-displayed cover art). Requires authentication. Owner or `superuser` only.
 
 **Request body:** (empty or no body required)
 
@@ -649,16 +754,18 @@ Response `200`:
 ```json
 {
   "success": true,
-  "data": "Primary thumbnail updated"
+  "data": "Primary cover updated"
 }
 ```
 
-- Unsets all other thumbnails from primary status.
-- Updates `audio.thumbnail_path` to point to this thumbnail.
+**Behavior:**
+- Unsets all other cover images from primary status (`is_primary = false`).
+- Updates `audio.thumbnail_path` to point to this cover image **only if the cover's `status` is `active`** (skips if still `processing`).
+- If the cover is still processing, `audio.thumbnail_path` remains unchanged until the cover becomes `active`.
 
 Errors:
 - `403` — authenticated user does not own the audio.
-- `404` — audio or thumbnail not found.
+- `404` — audio or cover image not found.
 - `500` — database error.
 
 ```bash
@@ -668,22 +775,23 @@ curl -X PATCH http://localhost:3000/api/audio/5/thumbnails/2 \
 
 ## DELETE /audio/{id}/thumbnails/{thumbnail_id}
 
-Deletes a specific thumbnail image. Requires authentication. Owner or `superuser` only.
+Deletes a specific cover image and all associated files (raw, thumbnail, preview). Requires authentication. Owner or `superuser` only.
 
 Response `200`:
 ```json
 {
   "success": true,
-  "data": "Thumbnail deleted"
+  "data": "Cover image deleted"
 }
 ```
 
-- If the deleted thumbnail was primary, the next thumbnail (in `sort_order` order) is automatically promoted to primary.
-- If this was the last thumbnail, `audio.thumbnail_path` is cleared.
+**Behavior:**
+- If the deleted cover was primary, the next cover (in `sort_order` order) is automatically promoted to primary **only if its status is `active`** (skips if still `processing`).
+- If this was the last cover or no active covers remain, `audio.thumbnail_path` is cleared to `NULL`.
 
 Errors:
 - `403` — authenticated user does not own the audio.
-- `404` — audio or thumbnail not found.
+- `404` — audio or cover image not found.
 - `500` — database or file system error.
 
 ```bash
