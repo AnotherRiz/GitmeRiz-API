@@ -212,20 +212,7 @@ Errors:
 
 ## GET /audio/t/{short_id}
 
-Serves the cover art thumbnail image by `short_id` inline (WebP, cached 1 year). Public endpoint with visibility check.
-
-**Access rules:**
-- `public` items: no authentication required.
-- `private` items: requires authentication and ownership (or `superuser`).
-
-Errors:
-- `401` — private audio and no authentication provided.
-- `403` — private audio and authenticated user is not the owner (and not `superuser`).
-- `404` — audio not found, has no thumbnail, or thumbnail file missing on disk.
-
-```bash
-curl -o cover.webp http://localhost:3000/api/audio/t/AbC12XyZ
-```
+**DEPRECATED** — This endpoint has been removed. Use `GET /audio/cover/t/{short_id_audio}?primary=true` instead to access the primary cover thumbnail.
 
 ## GET /audio/d/{id}
 
@@ -674,19 +661,26 @@ curl -o cover_original.jpg http://localhost:3000/api/audio/cover/CvR8Kx1P
 
 Serves the **thumbnail** (500px max width, WebP, quality 80) by cover `short_id`. Public endpoint with visibility check. Cached for 1 year.
 
+**Query Parameters:**
+- `primary` (optional, boolean): If set to `true`, treat the path parameter as audio `short_id` instead of cover `short_id`, and serve the thumbnail of the primary cover image. Defaults to `false`.
+
 **Access rules:**
 - Public audio items: no authentication required.
 - Private audio items: requires authentication and ownership (or `superuser`).
 
-Response `200`: WebP image data (`Content-Type: image/webp`).
+**Response `200`**: WebP image data (`Content-Type: image/webp`).
 
-Errors:
+**Errors:**
 - `401` — private audio and no authentication provided.
 - `403` — private audio and authenticated user is not the owner (and not `superuser`).
-- `404` — cover image not found, thumbnail not yet generated (still `processing`), or file missing on disk.
+- `404` — cover image not found, thumbnail not yet generated (still `processing`), file missing on disk, or (when `primary=true`) no primary cover exists for the audio item.
 
 ```bash
+# Serve thumbnail of a specific cover image
 curl -o cover_thumb.webp http://localhost:3000/api/audio/cover/t/CvR8Kx1P
+
+# Serve thumbnail of the primary cover image by audio short_id
+curl -o primary_cover_thumb.webp "http://localhost:3000/api/audio/cover/t/AbC12XyZ?primary=true"
 ```
 
 ## GET /audio/cover/p/{short_id_cover}

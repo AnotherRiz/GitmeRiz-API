@@ -1,6 +1,6 @@
 use axum::{
     body::Body,
-    extract::{Multipart, Path, State},
+    extract::{Multipart, Path, State, Query},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, patch, post},
@@ -66,6 +66,11 @@ pub struct ReorderAudioPinsRequest {
     pub ordered_ids: Vec<i32>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct CoverThumbnailQuery {
+    pub primary: Option<bool>,
+}
+
 #[derive(Debug, FromRow, Serialize, Clone)]
 pub struct AudioThumbnail {
     pub id: i32,
@@ -86,12 +91,10 @@ pub struct AudioThumbnail {
 // ─── Routes ────────────────────────────────────────────────────────────────────
 
 /// Public routes (no auth required, but private items check cookie/header)
-/// Public routes (no auth required, but private items check cookie/header)
 pub fn public_routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/audio/public", get(list_public_audio))
         .route("/audio/info/{short_id}", get(get_audio_by_short_id))
-        .route("/audio/t/{short_id}", get(serve_audio_thumbnail_by_short_id))
         .route("/audio/{id}", get(get_audio))
         .route("/audio/d/{id}", get(download_audio))
         .route("/audio/r/{short_id}", get(serve_audio_stream))
@@ -955,87 +958,6 @@ async fn get_audio_by_short_id(
     }
 }
 
-// GET /api/audio/thumb/:short_id - Serve audio cover art thumbnail by short_id (public with visibility check)
-async fn serve_audio_thumbnail_by_short_id(
-    State(state): State<Arc<AppState>>,
-    cookies: Cookies,
-    headers: HeaderMap,
-    Path(short_id): Path<String>,
-) -> impl IntoResponse {
-    let item: Result<AudioItem, _> = sqlx::query_as(&format!(
-        "SELECT {} FROM audio WHERE short_id = ?",
-        AUDIO_COLUMNS
-    ))
-    .bind(&short_id)
-    .fetch_one(&state.db.pool)
-    .await;
-
-    let item = match item {
-        Ok(item) => item,
-        Err(_) => {
-            return build_error_response(
-                StatusCode::NOT_FOUND,
-                "Audio not found",
-                &headers,
-                &state.config.frontend_url,
-            );
-        }
-    };
-
-    // Access control for private audio
-    if item.visibility == "private" {
-        let auth_user = extract_optional_auth(&cookies, &headers, &state.config.jwt_secret);
-        match auth_user {
-            Some(user) => {
-                if item.user_id != user.id && !user.is_superuser() {
-                    return build_error_response(
-                        StatusCode::FORBIDDEN,
-                        "You can only access your own private audio",
-                        &headers,
-                        &state.config.frontend_url,
-                    );
-                }
-            }
-            None => {
-                return build_error_response(
-                    StatusCode::UNAUTHORIZED,
-                    "This audio is private. Authentication required.",
-                    &headers,
-                    &state.config.frontend_url,
-                );
-            }
-        }
-    }
-
-    let thumb_path = match &item.thumbnail_path {
-        Some(p) => p,
-        None => {
-            return build_error_response(
-                StatusCode::NOT_FOUND,
-                "This audio has no thumbnail",
-                &headers,
-                &state.config.frontend_url,
-            );
-        }
-    };
-
-    match read_file(&state.config.storage_dir, thumb_path).await {
-        Ok(data) => Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "image/webp")
-            .header(header::CACHE_CONTROL, "public, max-age=31536000") // 1 year
-            .body(Body::from(data))
-            .unwrap()
-            .into_response(),
-        Err(_) => build_error_response(
-            StatusCode::NOT_FOUND,
-            "Thumbnail not found on disk",
-            &headers,
-            &state.config.frontend_url,
-        ),
-    }
-}
-
 // DELETE /api/audio/:id - Delete audio (owner or superuser)
 async fn delete_audio(
     Extension(auth_user): Extension<AuthUser>,
@@ -1591,12 +1513,49 @@ async fn serve_audio_cover_raw(
 }
 
 // GET /api/audio/cover/t/{short_id_cover} - Serve cover thumbnail (pre-generated WebP)
+// GET /api/audio/cover/t/{short_id_audio}?primary=true - Serve primary cover thumbnail
 async fn serve_audio_cover_thumbnail(
     State(state): State<Arc<AppState>>,
     Path(short_id_cover): Path<String>,
+    Query(query): Query<CoverThumbnailQuery>,
     cookies: Cookies,
     headers: HeaderMap,
 ) -> impl IntoResponse {
+    // If primary=true, resolve short_id_audio to primary cover short_id
+    let actual_short_id = if query.primary.unwrap_or(false) {
+        // short_id_cover is actually short_id_audio in this case
+        let result: Result<Option<String>, _> = sqlx::query_scalar(
+            "SELECT at.short_id FROM audio_thumbnails at
+             JOIN audio a ON a.id = at.audio_id
+             WHERE a.short_id = ? AND at.is_primary = true"
+        )
+        .bind(&short_id_cover)
+        .fetch_optional(&state.db.pool)
+        .await;
+
+        match result {
+            Ok(Some(sid)) => sid,
+            Ok(None) => {
+                return build_error_response(
+                    StatusCode::NOT_FOUND,
+                    "No primary cover found for this audio item",
+                    &headers,
+                    &state.config.frontend_url,
+                );
+            }
+            Err(_) => {
+                return build_error_response(
+                    StatusCode::NOT_FOUND,
+                    "Audio item not found",
+                    &headers,
+                    &state.config.frontend_url,
+                );
+            }
+        }
+    } else {
+        short_id_cover
+    };
+
     // Join with audio table to get visibility and user_id
     let result: Result<(Option<String>, String, i32, String), _> = sqlx::query_as(
         "SELECT at.thumbnail_path, a.visibility, a.user_id, at.status
@@ -1604,7 +1563,7 @@ async fn serve_audio_cover_thumbnail(
          JOIN audio a ON a.id = at.audio_id
          WHERE at.short_id = ?"
     )
-    .bind(&short_id_cover)
+    .bind(&actual_short_id)
     .fetch_one(&state.db.pool)
     .await;
 
