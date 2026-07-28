@@ -606,6 +606,125 @@ impl Database {
             }
         }
 
+        // --- Audio Thumbnails table column migrations (idempotent) ---
+
+        // Add short_id column to audio_thumbnails
+        let has_audio_thumb_short_id = matches!(
+            sqlx::query("SHOW COLUMNS FROM audio_thumbnails LIKE 'short_id'")
+                .fetch_optional(&self.pool)
+                .await,
+            Ok(Some(_))
+        );
+        if !has_audio_thumb_short_id {
+            tracing::info!("Adding short_id column to audio_thumbnails table");
+            sqlx::query("ALTER TABLE audio_thumbnails ADD COLUMN short_id CHAR(8)")
+                .execute(&self.pool)
+                .await?;
+
+            // Backfill existing rows with unique short_ids
+            let existing_rows: Vec<(i32,)> = sqlx::query_as("SELECT id FROM audio_thumbnails WHERE short_id IS NULL")
+                .fetch_all(&self.pool)
+                .await?;
+
+            for (id,) in existing_rows {
+                loop {
+                    let short_id = crate::media::generate_short_id();
+                    let result = sqlx::query("UPDATE audio_thumbnails SET short_id = ? WHERE id = ?")
+                        .bind(&short_id)
+                        .bind(id)
+                        .execute(&self.pool)
+                        .await;
+
+                    if result.is_ok() {
+                        break;
+                    }
+                    // If collision, retry with new short_id
+                }
+            }
+
+            // Now make it NOT NULL and UNIQUE
+            sqlx::query("ALTER TABLE audio_thumbnails MODIFY COLUMN short_id CHAR(8) NOT NULL")
+                .execute(&self.pool)
+                .await?;
+            sqlx::query("ALTER TABLE audio_thumbnails ADD UNIQUE KEY unique_audio_thumb_short_id (short_id)")
+                .execute(&self.pool)
+                .await?;
+
+            tracing::info!("Audio thumbnails short_id column added and backfilled successfully");
+        }
+
+        // Add raw_path column to audio_thumbnails
+        let has_audio_thumb_raw_path = matches!(
+            sqlx::query("SHOW COLUMNS FROM audio_thumbnails LIKE 'raw_path'")
+                .fetch_optional(&self.pool)
+                .await,
+            Ok(Some(_))
+        );
+        if !has_audio_thumb_raw_path {
+            tracing::info!("Adding raw_path column to audio_thumbnails table");
+            sqlx::query("ALTER TABLE audio_thumbnails ADD COLUMN raw_path VARCHAR(512)")
+                .execute(&self.pool)
+                .await?;
+
+            // Backfill: set raw_path = thumbnail_path for existing rows (best-effort fallback)
+            // since the original bytes were never retained during initial upload
+            sqlx::query("UPDATE audio_thumbnails SET raw_path = thumbnail_path WHERE raw_path IS NULL")
+                .execute(&self.pool)
+                .await?;
+
+            tracing::info!("Audio thumbnails raw_path column added and backfilled");
+        }
+
+        // Add preview_path column to audio_thumbnails
+        let has_audio_thumb_preview_path = matches!(
+            sqlx::query("SHOW COLUMNS FROM audio_thumbnails LIKE 'preview_path'")
+                .fetch_optional(&self.pool)
+                .await,
+            Ok(Some(_))
+        );
+        if !has_audio_thumb_preview_path {
+            tracing::info!("Adding preview_path column to audio_thumbnails table");
+            sqlx::query("ALTER TABLE audio_thumbnails ADD COLUMN preview_path VARCHAR(512)")
+                .execute(&self.pool)
+                .await?;
+
+            tracing::info!("Audio thumbnails preview_path column added");
+        }
+
+        // Add status column to audio_thumbnails
+        let has_audio_thumb_status = matches!(
+            sqlx::query("SHOW COLUMNS FROM audio_thumbnails LIKE 'status'")
+                .fetch_optional(&self.pool)
+                .await,
+            Ok(Some(_))
+        );
+        if !has_audio_thumb_status {
+            tracing::info!("Adding status column to audio_thumbnails table");
+            sqlx::query(
+                "ALTER TABLE audio_thumbnails ADD COLUMN status ENUM('processing', 'active', 'failed_processing') NOT NULL DEFAULT 'active'"
+            )
+            .execute(&self.pool)
+            .await?;
+
+            tracing::info!("Audio thumbnails status column added");
+        }
+
+        // Make thumbnail_path nullable (allow NULL during processing)
+        let thumb_path_nullable = matches!(
+            sqlx::query("SHOW COLUMNS FROM audio_thumbnails WHERE Field = 'thumbnail_path' AND Null = 'YES'")
+                .fetch_optional(&self.pool)
+                .await,
+            Ok(Some(_))
+        );
+        if !thumb_path_nullable {
+            tracing::info!("Making audio_thumbnails.thumbnail_path nullable");
+            sqlx::query("ALTER TABLE audio_thumbnails MODIFY COLUMN thumbnail_path VARCHAR(512)")
+                .execute(&self.pool)
+                .await?;
+
+            tracing::info!("Audio thumbnails thumbnail_path is now nullable");
+        }
+
         // Create blog_posts table
         sqlx::query(
             r#"

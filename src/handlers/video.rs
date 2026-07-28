@@ -103,7 +103,6 @@ pub fn public_routes() -> Router<Arc<AppState>> {
         .route("/video/{id}", get(get_video))
         .route("/video/d/{id}", get(download_video))
         .route("/video/info/{short_id}", get(get_video_by_short_id))
-        .route("/video/download/{short_id}", get(download_video_by_short_id))
         .route("/video/r/{short_id}", get(serve_video_stream))
         .route("/video/t/{short_id}", get(serve_video_thumbnail))
 }
@@ -1138,81 +1137,6 @@ async fn get_video_by_short_id(
         ),
     }
 }
-
-// GET /video/download/{short_id} — Download video file by short_id (attachment header)
-async fn download_video_by_short_id(
-    State(state): State<Arc<AppState>>,
-    cookies: Cookies,
-    headers: HeaderMap,
-    Path(short_id): Path<String>,
-) -> impl IntoResponse {
-    let item: Result<VideoItem, _> = sqlx::query_as(&format!(
-        "SELECT {} FROM videos WHERE short_id = ?",
-        VIDEO_COLUMNS
-    ))
-    .bind(&short_id)
-    .fetch_one(&state.db.pool)
-    .await;
-
-    match item {
-        Ok(item) => {
-            // Access control for private videos
-            if item.visibility == "private" {
-                let auth_user = extract_optional_auth(&cookies, &headers, &state.config.jwt_secret);
-                match auth_user {
-                    Some(user) => {
-                        if item.user_id != user.id && !user.is_superuser() {
-                            return build_error_response(
-                                StatusCode::FORBIDDEN,
-                                "You can only access your own private videos",
-                                &headers,
-                                &state.config.frontend_url,
-                            );
-                        }
-                    }
-                    None => {
-                        return build_error_response(
-                            StatusCode::UNAUTHORIZED,
-                            "This video is private. Authentication required.",
-                            &headers,
-                            &state.config.frontend_url,
-                        );
-                    }
-                }
-            }
-
-            let serve_path = get_servable_path(&item);
-            match crate::media::read_file(&state.config.storage_dir, serve_path).await {
-                Ok(data) => {
-                    let body = Body::from(data);
-                    Response::builder()
-                        .status(StatusCode::OK)
-                        .header(header::CONTENT_TYPE, get_servable_mime(&item))
-                        .header(
-                            header::CONTENT_DISPOSITION,
-                            format!("attachment; filename=\"{}\"", item.original_filename),
-                        )
-                        .body(body)
-                        .unwrap()
-                        .into_response()
-                }
-                Err(_) => build_error_response(
-                    StatusCode::NOT_FOUND,
-                    "File not found on disk",
-                    &headers,
-                    &state.config.frontend_url,
-                ),
-            }
-        }
-        Err(_) => build_error_response(
-            StatusCode::NOT_FOUND,
-            "Video not found",
-            &headers,
-            &state.config.frontend_url,
-        ),
-    }
-}
-
 
 // GET /video/r/{short_id} — Serve video inline with HTTP Range support for streaming
 async fn serve_video_stream(

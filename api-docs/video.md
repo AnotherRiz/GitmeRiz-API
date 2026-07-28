@@ -172,11 +172,6 @@ Downloads the video file with `Content-Disposition: attachment` using the numeri
 Returns a single video's metadata using the 8-character `short_id`. Public endpoint for public videos. (Convenient for watch/detail pages when numeric ID is not known).
 * **Access rules**: Same as `GET /video/{id}`.
 
-## GET /video/download/{short_id}
-
-Downloads the video file with `Content-Disposition: attachment` using the 8-character `short_id`. Public endpoint for public videos. Serves transcoded file if available.
-* **Access rules**: Same as `GET /video/{id}`.
-
 ## GET /video/r/{short_id}
 
 Serves the video file inline for HTML5 `<video>` tags. Supports HTTP `Range` requests for scrubbing.

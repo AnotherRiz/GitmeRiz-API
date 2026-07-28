@@ -16,8 +16,9 @@ use crate::auth::validate_token;
 use crate::error_page::build_error_response;
 use crate::media::{
     delete_file, generate_storage_path, generate_thumbnail_only, generate_thumbnail_path,
-    read_file, save_file, validate_extension, generate_short_id, validate_thumbnail,
-    ALLOWED_THUMBNAIL_EXTENSIONS, MediaType,
+    generate_preview_path, generate_thumbnail_and_preview, read_file, save_file, validate_extension, 
+    generate_short_id, validate_thumbnail, get_extension, ALLOWED_THUMBNAIL_EXTENSIONS, MediaType,
+
 };
 use crate::models::{ApiResponse, AuthUser};
 use crate::AppState;
@@ -26,6 +27,9 @@ use crate::AppState;
 
 /// Column list used in all SELECT queries (keep in sync with AudioItem struct)
 const AUDIO_COLUMNS: &str = "id, user_id, title, description, original_filename, stored_path, size_bytes, mime_type, visibility, thumbnail_path, pinned, pin_order, short_id, created_at";
+
+/// Column list for audio_thumbnails queries
+const AUDIO_THUMBNAIL_COLUMNS: &str = "id, audio_id, short_id, raw_path, thumbnail_path, preview_path, is_primary, sort_order, status, created_at";
 
 // ─── Data Structures ───────────────────────────────────────────────────────────
 
@@ -66,24 +70,35 @@ pub struct ReorderAudioPinsRequest {
 pub struct AudioThumbnail {
     pub id: i32,
     pub audio_id: i32,
-    pub thumbnail_path: String,
+    pub short_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thumbnail_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preview_path: Option<String>,
     pub is_primary: bool,
     pub sort_order: i32,
+    pub status: String,
     pub created_at: DateTime<Utc>,
 }
 
 // ─── Routes ────────────────────────────────────────────────────────────────────
 
 /// Public routes (no auth required, but private items check cookie/header)
+/// Public routes (no auth required, but private items check cookie/header)
 pub fn public_routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/audio/public", get(list_public_audio))
         .route("/audio/info/{short_id}", get(get_audio_by_short_id))
-        .route("/audio/download/{short_id}", get(download_audio_by_short_id))
         .route("/audio/t/{short_id}", get(serve_audio_thumbnail_by_short_id))
         .route("/audio/{id}", get(get_audio))
         .route("/audio/d/{id}", get(download_audio))
         .route("/audio/r/{short_id}", get(serve_audio_stream))
+        .route("/audio/cover/{short_id_cover}", get(serve_audio_cover_raw))
+        .route("/audio/cover/t/{short_id_cover}", get(serve_audio_cover_thumbnail))
+        .route("/audio/cover/p/{short_id_cover}", get(serve_audio_cover_preview))
+        .route("/audio/{short_id_audio}/cover/{short_id_cover}", get(get_audio_cover_scoped))
 }
 
 /// Protected routes (require auth middleware)
@@ -95,7 +110,7 @@ pub fn protected_routes() -> Router<Arc<AppState>> {
         .route("/audio/me/pinned", get(list_pinned_audio))
         .route("/audio/reorder-pins", patch(reorder_audio_pins))
         .route("/audio/{id}/thumbnails", post(add_audio_thumbnails).get(list_audio_thumbnails))
-        .route("/audio/{id}/thumbnails/{thumbnail_id}", get(get_audio_thumbnail).patch(set_primary_audio_thumbnail).delete(delete_audio_thumbnail))
+        .route("/audio/{id}/thumbnails/{thumbnail_id}", patch(set_primary_audio_thumbnail).delete(delete_audio_thumbnail))
 }
 
 // ─── Helpers ───────────────────────────────────────────────────────────────────
@@ -940,79 +955,6 @@ async fn get_audio_by_short_id(
     }
 }
 
-// GET /api/audio/download/:short_id - Download audio file by short_id (public with visibility check)
-async fn download_audio_by_short_id(
-    State(state): State<Arc<AppState>>,
-    cookies: Cookies,
-    headers: HeaderMap,
-    Path(short_id): Path<String>,
-) -> impl IntoResponse {
-    let item: Result<AudioItem, _> = sqlx::query_as(&format!(
-        "SELECT {} FROM audio WHERE short_id = ?",
-        AUDIO_COLUMNS
-    ))
-    .bind(&short_id)
-    .fetch_one(&state.db.pool)
-    .await;
-
-    match item {
-        Ok(item) => {
-            // Access control for private audio
-            if item.visibility == "private" {
-                let auth_user = extract_optional_auth(&cookies, &headers, &state.config.jwt_secret);
-                match auth_user {
-                    Some(user) => {
-                        if item.user_id != user.id && !user.is_superuser() {
-                            return build_error_response(
-                                StatusCode::FORBIDDEN,
-                                "You can only access your own private audio",
-                                &headers,
-                                &state.config.frontend_url,
-                            );
-                        }
-                    }
-                    None => {
-                        return build_error_response(
-                            StatusCode::UNAUTHORIZED,
-                            "This audio is private. Authentication required.",
-                            &headers,
-                            &state.config.frontend_url,
-                        );
-                    }
-                }
-            }
-
-            match read_file(&state.config.storage_dir, &item.stored_path).await {
-                Ok(data) => {
-                    let body = Body::from(data);
-                    Response::builder()
-                        .status(StatusCode::OK)
-                        .header(header::CONTENT_TYPE, item.mime_type)
-                        .header(
-                            header::CONTENT_DISPOSITION,
-                            format!("attachment; filename=\"{}\"", item.original_filename),
-                        )
-                        .body(body)
-                        .unwrap()
-                        .into_response()
-                }
-                Err(_) => build_error_response(
-                    StatusCode::NOT_FOUND,
-                    "File not found on disk",
-                    &headers,
-                    &state.config.frontend_url,
-                ),
-            }
-        }
-        Err(_) => build_error_response(
-            StatusCode::NOT_FOUND,
-            "Audio not found",
-            &headers,
-            &state.config.frontend_url,
-        ),
-    }
-}
-
 // GET /api/audio/thumb/:short_id - Serve audio cover art thumbnail by short_id (public with visibility check)
 async fn serve_audio_thumbnail_by_short_id(
     State(state): State<Arc<AppState>>,
@@ -1117,6 +1059,13 @@ async fn delete_audio(
                 );
             }
 
+            // Fetch all thumbnails (with all paths) before deleting audio (for cascading delete)
+            let thumbnails: Result<Vec<(Option<String>, Option<String>, Option<String>)>, _> =
+                sqlx::query_as("SELECT raw_path, thumbnail_path, preview_path FROM audio_thumbnails WHERE audio_id = ?")
+                    .bind(id)
+                    .fetch_all(&state.db.pool)
+                    .await;
+
             // Delete audio (CASCADE deletes audio_thumbnails rows automatically)
             let result = sqlx::query("DELETE FROM audio WHERE id = ?")
                 .bind(id)
@@ -1129,29 +1078,28 @@ async fn delete_audio(
                     if let Err(e) = delete_file(&state.config.storage_dir, &item.stored_path).await {
                         tracing::warn!("Failed to delete audio file from disk: {}", e);
                     }
-                    
-                    // Delete primary thumbnail if it exists
-                    if let Some(thumb) = &item.thumbnail_path {
-                        if let Err(e) = delete_file(&state.config.storage_dir, thumb).await {
-                            tracing::warn!("Failed to delete primary thumbnail from disk: {}", e);
-                        }
-                    }
-                    
-                    // Delete all thumbnail files from audio_thumbnails table
-                    let thumbnails: Result<Vec<(String,)>, _> =
-                        sqlx::query_as("SELECT thumbnail_path FROM audio_thumbnails WHERE audio_id = ?")
-                            .bind(id)
-                            .fetch_all(&state.db.pool)
-                            .await;
-                    
+
+                    // Delete all thumbnail files (raw, thumbnail, preview)
                     if let Ok(thumbs) = thumbnails {
-                        for (thumb_path,) in thumbs {
-                            if let Err(e) = delete_file(&state.config.storage_dir, &thumb_path).await {
-                                tracing::warn!("Failed to delete audio thumbnail file from disk: {}", e);
+                        for (raw_path, thumbnail_path, preview_path) in thumbs {
+                            if let Some(path) = raw_path {
+                                if let Err(e) = delete_file(&state.config.storage_dir, &path).await {
+                                    tracing::warn!("Failed to delete cover raw file from disk: {}", e);
+                                }
+                            }
+                            if let Some(path) = thumbnail_path {
+                                if let Err(e) = delete_file(&state.config.storage_dir, &path).await {
+                                    tracing::warn!("Failed to delete cover thumbnail file from disk: {}", e);
+                                }
+                            }
+                            if let Some(path) = preview_path {
+                                if let Err(e) = delete_file(&state.config.storage_dir, &path).await {
+                                    tracing::warn!("Failed to delete cover preview file from disk: {}", e);
+                                }
                             }
                         }
                     }
-                    
+
                     (
                         StatusCode::OK,
                         Json(ApiResponse::success("Audio deleted".to_string())),
@@ -1174,7 +1122,7 @@ async fn delete_audio(
 // NEW AUDIO THUMBNAIL ENDPOINTS (Part 2)
 // ───────────────────────────────────────────────────────────────────────────────
 
-// POST /api/audio/:id/thumbnails - Add up to 20 thumbnails to an audio item (up to 5MB each)
+// POST /api/audio/:id/thumbnails - Add up to 20 thumbnails to an audio item (async two-phase processing)
 async fn add_audio_thumbnails(
     Extension(auth_user): Extension<AuthUser>,
     State(state): State<Arc<AppState>>,
@@ -1234,16 +1182,15 @@ async fn add_audio_thumbnails(
         );
     }
 
-    let mut added_thumbnails = Vec::new();
+    let mut raw_files = Vec::new();
 
-    // Parse multipart fields
+    // PHASE 1: Parse multipart, save raw files, and insert DB rows with status='processing'
     while let Ok(Some(field)) = multipart.next_field().await {
         let field_name = field.name().unwrap_or("").to_string();
 
         if field_name == "thumbnails" {
-            // Extract filename BEFORE consuming the field with bytes()
             let filename = field.file_name().unwrap_or("thumbnail.jpg").to_string();
-            
+
             if let Ok(bytes) = field.bytes().await {
                 if bytes.is_empty() {
                     continue;
@@ -1256,96 +1203,242 @@ async fn add_audio_thumbnails(
                 }
 
                 // Stop if we've reached the limit while processing
-                if added_thumbnails.len() as i64 >= (MAX_THUMBNAILS_PER_AUDIO - current_count) {
+                if raw_files.len() as i64 >= (MAX_THUMBNAILS_PER_AUDIO - current_count) {
                     break;
                 }
 
-                // Generate thumbnail from image bytes
-                let permit = state.image_semaphore.clone().acquire_owned().await;
-                if permit.is_err() {
-                    tracing::warn!("Image semaphore closed, skipping thumbnail");
-                    continue;
-                }
-
-                let thumb_result =
-                    tokio::task::spawn_blocking(move || generate_thumbnail_only(&bytes)).await;
-
-                let webp_bytes = match thumb_result {
-                    Ok(Ok(data)) => data,
-                    Ok(Err(e)) => {
-                        tracing::warn!("Failed to generate thumbnail: {}", e);
-                        continue;
-                    }
-                    Err(e) => {
-                        tracing::warn!("Thumbnail generation task panicked: {}", e);
-                        continue;
-                    }
-                };
-
-                // Generate storage path for thumbnail
-                let (thumbnail_path, full_path) =
-                    generate_storage_path(&state.config.storage_dir, MediaType::Audio, ".webp");
-
-                // Save thumbnail file
-                if let Err(e) = save_file(&full_path, &webp_bytes).await {
-                    tracing::error!("Failed to save thumbnail: {}", e);
-                    continue;
-                }
-
-                // Insert into audio_thumbnails table
-                let is_primary = audio_item.thumbnail_path.is_none() && added_thumbnails.is_empty();
-                let sort_order = (current_count + added_thumbnails.len() as i64) as i32;
-
-                let insert_result = sqlx::query(
-                    "INSERT INTO audio_thumbnails (audio_id, thumbnail_path, is_primary, sort_order) VALUES (?, ?, ?, ?)",
-                )
-                .bind(id)
-                .bind(&thumbnail_path)
-                .bind(is_primary)
-                .bind(sort_order)
-                .execute(&state.db.pool)
-                .await;
-
-                match insert_result {
-                    Ok(res) => {
-                        let thumb_id = res.last_insert_id() as i32;
-                        
-                        // If this is the first thumbnail, update audio.thumbnail_path
-                        if is_primary {
-                            let _ = sqlx::query("UPDATE audio SET thumbnail_path = ? WHERE id = ?")
-                                .bind(&thumbnail_path)
-                                .bind(id)
-                                .execute(&state.db.pool)
-                                .await;
-                        }
-
-                        added_thumbnails.push(AudioThumbnail {
-                            id: thumb_id,
-                            audio_id: id,
-                            thumbnail_path,
-                            is_primary,
-                            sort_order,
-                            created_at: DateTime::from(Utc::now()),
-                        });
-                    }
-                    Err(e) => {
-                        tracing::error!("Failed to insert thumbnail: {}", e);
-                        // Clean up the file
-                        let _ = delete_file(&state.config.storage_dir, &thumbnail_path).await;
-                    }
-                }
+                raw_files.push((filename, bytes.to_vec()));
             }
         }
     }
 
-    if added_thumbnails.is_empty() {
+    if raw_files.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
             Json(ApiResponse::error("No valid thumbnails were uploaded")),
         );
     }
 
-    (StatusCode::CREATED, Json(ApiResponse::success(added_thumbnails)))
+    let mut uploaded_thumbnails: Vec<AudioThumbnail> = Vec::new();
+
+    // Save raw files and insert DB rows
+    for (filename, file_bytes) in raw_files {
+        let ext = get_extension(&filename).unwrap_or_default();
+        let (raw_path, full_path) =
+            generate_storage_path(&state.config.storage_dir, MediaType::Audio, &ext);
+
+        // Save raw file to disk
+        if let Err(e) = save_file(&full_path, &file_bytes).await {
+            tracing::error!("Failed to save raw thumbnail file {}: {}", filename, e);
+            // Clean up already-saved files on error
+            for item in &uploaded_thumbnails {
+                let _ = delete_file(&state.config.storage_dir, &item.raw_path.as_ref().unwrap_or(&String::new())).await;
+            }
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::error("Failed to save thumbnail file to disk")),
+            );
+        }
+
+        // Generate unique short_id for this cover
+        let short_id = loop {
+            let candidate = generate_short_id();
+            let exists: Result<Option<(i32,)>, _> = sqlx::query_as(
+                "SELECT id FROM audio_thumbnails WHERE short_id = ?"
+            )
+            .bind(&candidate)
+            .fetch_optional(&state.db.pool)
+            .await;
+
+            match exists {
+                Ok(None) => break candidate,
+                Ok(Some(_)) => continue,
+                Err(e) => {
+                    tracing::error!("Failed to check short_id uniqueness: {}", e);
+                    for item in &uploaded_thumbnails {
+                        let _ = delete_file(&state.config.storage_dir, &item.raw_path.as_ref().unwrap_or(&String::new())).await;
+                    }
+                    let _ = delete_file(&state.config.storage_dir, &raw_path).await;
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ApiResponse::error("Failed to generate unique short_id")),
+                    );
+                }
+            }
+        };
+
+        // Is this the first thumbnail (and no primary exists)?
+        let is_primary = audio_item.thumbnail_path.is_none() && uploaded_thumbnails.is_empty();
+        let sort_order = (current_count + uploaded_thumbnails.len() as i64) as i32;
+
+        // Insert with status='processing', all paths except raw_path are NULL initially
+        let insert_result = sqlx::query(
+            "INSERT INTO audio_thumbnails (audio_id, short_id, raw_path, thumbnail_path, preview_path, is_primary, sort_order, status) 
+             VALUES (?, ?, ?, NULL, NULL, ?, ?, 'processing')"
+        )
+        .bind(id)
+        .bind(&short_id)
+        .bind(&raw_path)
+        .bind(is_primary)
+        .bind(sort_order)
+        .execute(&state.db.pool)
+        .await;
+
+        match insert_result {
+            Ok(res) => {
+                let thumb_id = res.last_insert_id() as i32;
+                uploaded_thumbnails.push(AudioThumbnail {
+                    id: thumb_id,
+                    audio_id: id,
+                    short_id,
+                    raw_path: Some(raw_path),
+                    thumbnail_path: None,
+                    preview_path: None,
+                    is_primary,
+                    sort_order,
+                    status: "processing".to_string(),
+                    created_at: DateTime::from(Utc::now()),
+                });
+            }
+            Err(e) => {
+                tracing::error!("Failed to insert thumbnail: {}", e);
+                for item in &uploaded_thumbnails {
+                    let _ = delete_file(&state.config.storage_dir, &item.raw_path.as_ref().unwrap_or(&String::new())).await;
+                }
+                let _ = delete_file(&state.config.storage_dir, &raw_path).await;
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ApiResponse::error("Failed to save thumbnail metadata")),
+                );
+            }
+        }
+    }
+
+    tracing::info!(total_uploaded = uploaded_thumbnails.len(), "Thumbnails uploaded, spawning background processing");
+
+    // PHASE 2: Spawn detached background task for thumbnail/preview generation
+    let db_pool = state.db.pool.clone();
+    let storage_dir = state.config.storage_dir.clone();
+    let semaphore = state.image_semaphore.clone();
+    let items_to_process = uploaded_thumbnails.clone();
+
+    tokio::spawn(async move {
+        for item in &items_to_process {
+            let semaphore = semaphore.clone();
+            let db_pool = db_pool.clone();
+            let storage_dir = storage_dir.clone();
+            let raw_path = item.raw_path.clone().unwrap_or_default();
+            let item_id = item.id;
+            let audio_id = item.audio_id;
+            let is_primary = item.is_primary;
+
+            let task = tokio::spawn(async move {
+                // Read raw file
+                let file_bytes = match read_file(&storage_dir, &raw_path).await {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        tracing::error!("Failed to read raw thumbnail: {}", e);
+                        return;
+                    }
+                };
+
+                // Acquire semaphore (memory ceiling)
+                let _permit = match semaphore.acquire_owned().await {
+                    Ok(p) => p,
+                    Err(_) => {
+                        tracing::error!("Semaphore closed");
+                        return;
+                    }
+                };
+
+                // Generate thumbnail + preview
+                let file_bytes_clone = file_bytes.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    generate_thumbnail_and_preview(&file_bytes_clone)
+                })
+                .await;
+
+                let (thumb_bytes, preview_bytes) = match result {
+                    Ok(Ok((thumb, preview))) => (thumb, preview),
+                    Ok(Err(e)) => {
+                        tracing::error!("Failed to generate thumbnail/preview: {}", e);
+                        let _ = sqlx::query("UPDATE audio_thumbnails SET status = 'failed_processing' WHERE id = ?")
+                            .bind(item_id)
+                            .execute(&db_pool)
+                            .await;
+                        return;
+                    }
+                    Err(e) => {
+                        tracing::error!("Spawn blocking panicked: {}", e);
+                        let _ = sqlx::query("UPDATE audio_thumbnails SET status = 'failed_processing' WHERE id = ?")
+                            .bind(item_id)
+                            .execute(&db_pool)
+                            .await;
+                        return;
+                    }
+                };
+
+                // Generate storage paths for thumbnail and preview
+                let thumbnail_path = generate_thumbnail_path(&raw_path);
+                let preview_path = generate_preview_path(&raw_path);
+
+                // Save thumbnail file
+                let thumb_full_path = std::path::PathBuf::from(&storage_dir).join(&thumbnail_path);
+                if let Err(e) = save_file(&thumb_full_path, &thumb_bytes).await {
+                    tracing::error!("Failed to save thumbnail file: {}", e);
+                    let _ = sqlx::query("UPDATE audio_thumbnails SET status = 'failed_processing' WHERE id = ?")
+                        .bind(item_id)
+                        .execute(&db_pool)
+                        .await;
+                    return;
+                }
+
+                // Save preview file
+                let preview_full_path = std::path::PathBuf::from(&storage_dir).join(&preview_path);
+                if let Err(e) = save_file(&preview_full_path, &preview_bytes).await {
+                    tracing::error!("Failed to save preview file: {}", e);
+                    let _ = delete_file(&storage_dir, &thumbnail_path).await;
+                    let _ = sqlx::query("UPDATE audio_thumbnails SET status = 'failed_processing' WHERE id = ?")
+                        .bind(item_id)
+                        .execute(&db_pool)
+                        .await;
+                    return;
+                }
+
+                // Update database with paths and status='active'
+                let update_result = sqlx::query(
+                    "UPDATE audio_thumbnails SET thumbnail_path = ?, preview_path = ?, status = 'active' WHERE id = ?"
+                )
+                .bind(&thumbnail_path)
+                .bind(&preview_path)
+                .bind(item_id)
+                .execute(&db_pool)
+                .await;
+
+                if let Err(e) = update_result {
+                    tracing::error!("Failed to update thumbnail metadata: {}", e);
+                    let _ = delete_file(&storage_dir, &thumbnail_path).await;
+                    let _ = delete_file(&storage_dir, &preview_path).await;
+                    return;
+                }
+
+                // If this is primary, mirror thumbnail_path to audio.thumbnail_path
+                if is_primary {
+                    let _ = sqlx::query("UPDATE audio SET thumbnail_path = ? WHERE id = ?")
+                        .bind(&thumbnail_path)
+                        .bind(audio_id)
+                        .execute(&db_pool)
+                        .await;
+                }
+
+                tracing::info!("Thumbnail processing completed for cover {}", item_id);
+            });
+
+            let _ = task.await;
+        }
+    });
+
+    (StatusCode::ACCEPTED, Json(ApiResponse::success(uploaded_thumbnails)))
 }
 
 // GET /api/audio/:id/thumbnails - List all thumbnails for an audio item
@@ -1380,9 +1473,10 @@ async fn list_audio_thumbnails(
         );
     }
 
-    let thumbnails: Result<Vec<AudioThumbnail>, _> = sqlx::query_as(
-        "SELECT id, audio_id, thumbnail_path, is_primary, sort_order, created_at FROM audio_thumbnails WHERE audio_id = ? ORDER BY sort_order ASC, id ASC"
-    )
+    let thumbnails: Result<Vec<AudioThumbnail>, _> = sqlx::query_as(&format!(
+        "SELECT {} FROM audio_thumbnails WHERE audio_id = ? ORDER BY sort_order ASC, id ASC",
+        AUDIO_THUMBNAIL_COLUMNS
+    ))
     .bind(id)
     .fetch_all(&state.db.pool)
     .await;
@@ -1396,31 +1490,356 @@ async fn list_audio_thumbnails(
     }
 }
 
-// GET /api/audio/:id/thumbnails/:thumbnail_id - Serve a specific thumbnail image
-async fn get_audio_thumbnail(
+// GET /api/audio/cover/{short_id_cover} - Serve raw cover image inline
+async fn serve_audio_cover_raw(
     State(state): State<Arc<AppState>>,
-    Path((id, thumbnail_id)): Path<(i32, i32)>,
+    Path(short_id_cover): Path<String>,
+    cookies: Cookies,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
-    let thumbnail: Result<(String,), _> = sqlx::query_as(
-        "SELECT thumbnail_path FROM audio_thumbnails WHERE id = ? AND audio_id = ?"
+    // Join with audio table to get visibility and user_id
+    let result: Result<(String, String, i32, String), _> = sqlx::query_as(
+        "SELECT at.raw_path, a.visibility, a.user_id, at.status
+         FROM audio_thumbnails at
+         JOIN audio a ON a.id = at.audio_id
+         WHERE at.short_id = ?"
     )
-    .bind(thumbnail_id)
-    .bind(id)
+    .bind(&short_id_cover)
     .fetch_one(&state.db.pool)
     .await;
 
-    let (thumb_path,) = match thumbnail {
-        Ok(t) => t,
+    let (raw_path, visibility, user_id, status) = match result {
+        Ok(row) => row,
         Err(_) => {
             return build_error_response(
                 StatusCode::NOT_FOUND,
-                "Thumbnail not found",
-                &HeaderMap::new(),
-                "http://localhost:5173",
+                "Cover image not found",
+                &headers,
+                &state.config.frontend_url,
             );
         }
     };
 
+    // Check if still processing
+    if status != "active" {
+        return build_error_response(
+            StatusCode::NOT_FOUND,
+            "Cover image still processing",
+            &headers,
+            &state.config.frontend_url,
+        );
+    }
+
+    // Access control based on visibility
+    if visibility == "private" {
+        let auth_user = extract_optional_auth(&cookies, &headers, &state.config.jwt_secret);
+        match auth_user {
+            Some(user) => {
+                if user_id != user.id && !user.is_superuser() {
+                    return build_error_response(
+                        StatusCode::FORBIDDEN,
+                        "You can only access your own private cover images",
+                        &headers,
+                        &state.config.frontend_url,
+                    );
+                }
+            }
+            None => {
+                return build_error_response(
+                    StatusCode::UNAUTHORIZED,
+                    "This cover image is private. Authentication required.",
+                    &headers,
+                    &state.config.frontend_url,
+                );
+            }
+        }
+    }
+
+    match read_file(&state.config.storage_dir, &raw_path).await {
+        Ok(data) => {
+            // Try to determine mime type from raw_path extension
+            let mime_type = if let Some(ext) = raw_path.rsplit('.').next() {
+                match ext.to_lowercase().as_str() {
+                    "jpg" | "jpeg" => "image/jpeg",
+                    "png" => "image/png",
+                    "gif" => "image/gif",
+                    "webp" => "image/webp",
+                    _ => "application/octet-stream",
+                }
+            } else {
+                "application/octet-stream"
+            };
+
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, mime_type)
+                .header(
+                    header::CONTENT_DISPOSITION,
+                    "inline",
+                )
+                .body(Body::from(data))
+                .unwrap()
+                .into_response()
+        }
+        Err(_) => build_error_response(
+            StatusCode::NOT_FOUND,
+            "Cover file not found on disk",
+            &headers,
+            &state.config.frontend_url,
+        ),
+    }
+}
+
+// GET /api/audio/cover/t/{short_id_cover} - Serve cover thumbnail (pre-generated WebP)
+async fn serve_audio_cover_thumbnail(
+    State(state): State<Arc<AppState>>,
+    Path(short_id_cover): Path<String>,
+    cookies: Cookies,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    // Join with audio table to get visibility and user_id
+    let result: Result<(Option<String>, String, i32, String), _> = sqlx::query_as(
+        "SELECT at.thumbnail_path, a.visibility, a.user_id, at.status
+         FROM audio_thumbnails at
+         JOIN audio a ON a.id = at.audio_id
+         WHERE at.short_id = ?"
+    )
+    .bind(&short_id_cover)
+    .fetch_one(&state.db.pool)
+    .await;
+
+    let (thumbnail_path, visibility, user_id, status) = match result {
+        Ok(row) => row,
+        Err(_) => {
+            return build_error_response(
+                StatusCode::NOT_FOUND,
+                "Cover image not found",
+                &headers,
+                &state.config.frontend_url,
+            );
+        }
+    };
+
+    // Check if still processing or no thumbnail yet
+    if status != "active" || thumbnail_path.is_none() {
+        return build_error_response(
+            StatusCode::NOT_FOUND,
+            "Cover thumbnail still processing",
+            &headers,
+            &state.config.frontend_url,
+        );
+    }
+
+    // Access control based on visibility
+    if visibility == "private" {
+        let auth_user = extract_optional_auth(&cookies, &headers, &state.config.jwt_secret);
+        match auth_user {
+            Some(user) => {
+                if user_id != user.id && !user.is_superuser() {
+                    return build_error_response(
+                        StatusCode::FORBIDDEN,
+                        "You can only access your own private cover images",
+                        &headers,
+                        &state.config.frontend_url,
+                    );
+                }
+            }
+            None => {
+                return build_error_response(
+                    StatusCode::UNAUTHORIZED,
+                    "This cover image is private. Authentication required.",
+                    &headers,
+                    &state.config.frontend_url,
+                );
+            }
+        }
+    }
+
+    let thumb_path = thumbnail_path.unwrap_or_default();
+    match read_file(&state.config.storage_dir, &thumb_path).await {
+        Ok(data) => Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "image/webp")
+            .header(header::CACHE_CONTROL, "public, max-age=31536000") // 1 year
+            .body(Body::from(data))
+            .unwrap()
+            .into_response(),
+        Err(_) => build_error_response(
+            StatusCode::NOT_FOUND,
+            "Cover thumbnail file not found on disk",
+            &headers,
+            &state.config.frontend_url,
+        ),
+    }
+}
+
+// GET /api/audio/cover/p/{short_id_cover} - Serve cover preview (pre-generated WebP, larger than thumbnail)
+async fn serve_audio_cover_preview(
+    State(state): State<Arc<AppState>>,
+    Path(short_id_cover): Path<String>,
+    cookies: Cookies,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    // Join with audio table to get visibility and user_id
+    let result: Result<(Option<String>, String, i32, String), _> = sqlx::query_as(
+        "SELECT at.preview_path, a.visibility, a.user_id, at.status
+         FROM audio_thumbnails at
+         JOIN audio a ON a.id = at.audio_id
+         WHERE at.short_id = ?"
+    )
+    .bind(&short_id_cover)
+    .fetch_one(&state.db.pool)
+    .await;
+
+    let (preview_path, visibility, user_id, status) = match result {
+        Ok(row) => row,
+        Err(_) => {
+            return build_error_response(
+                StatusCode::NOT_FOUND,
+                "Cover image not found",
+                &headers,
+                &state.config.frontend_url,
+            );
+        }
+    };
+
+    // Check if still processing or no preview yet
+    if status != "active" || preview_path.is_none() {
+        return build_error_response(
+            StatusCode::NOT_FOUND,
+            "Cover preview still processing",
+            &headers,
+            &state.config.frontend_url,
+        );
+    }
+
+    // Access control based on visibility
+    if visibility == "private" {
+        let auth_user = extract_optional_auth(&cookies, &headers, &state.config.jwt_secret);
+        match auth_user {
+            Some(user) => {
+                if user_id != user.id && !user.is_superuser() {
+                    return build_error_response(
+                        StatusCode::FORBIDDEN,
+                        "You can only access your own private cover images",
+                        &headers,
+                        &state.config.frontend_url,
+                    );
+                }
+            }
+            None => {
+                return build_error_response(
+                    StatusCode::UNAUTHORIZED,
+                    "This cover image is private. Authentication required.",
+                    &headers,
+                    &state.config.frontend_url,
+                );
+            }
+        }
+    }
+
+    let prev_path = preview_path.unwrap_or_default();
+    match read_file(&state.config.storage_dir, &prev_path).await {
+        Ok(data) => Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "image/webp")
+            .header(header::CACHE_CONTROL, "public, max-age=3600") // 1 hour
+            .body(Body::from(data))
+            .unwrap()
+            .into_response(),
+        Err(_) => build_error_response(
+            StatusCode::NOT_FOUND,
+            "Cover preview file not found on disk",
+            &headers,
+            &state.config.frontend_url,
+        ),
+    }
+}
+
+// GET /api/audio/{short_id_audio}/cover/{short_id_cover} - Serve scoped cover thumbnail (replaces old /audio/{id}/thumbnails/{thumbnail_id})
+async fn get_audio_cover_scoped(
+    State(state): State<Arc<AppState>>,
+    Path((short_id_audio, short_id_cover)): Path<(String, String)>,
+    cookies: Cookies,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    // Look up audio by short_id
+    let audio_result: Result<(i32, String, i32), _> = sqlx::query_as(
+        "SELECT id, visibility, user_id FROM audio WHERE short_id = ?"
+    )
+    .bind(&short_id_audio)
+    .fetch_one(&state.db.pool)
+    .await;
+
+    let (audio_id, visibility, user_id) = match audio_result {
+        Ok(row) => row,
+        Err(_) => {
+            return build_error_response(
+                StatusCode::NOT_FOUND,
+                "Audio not found",
+                &headers,
+                &state.config.frontend_url,
+            );
+        }
+    };
+
+    // Look up cover by short_id AND audio_id (prevents cross-audio cover access)
+    let cover_result: Result<(Option<String>, String), _> = sqlx::query_as(
+        "SELECT thumbnail_path, status FROM audio_thumbnails WHERE short_id = ? AND audio_id = ?"
+    )
+    .bind(&short_id_cover)
+    .bind(audio_id)
+    .fetch_one(&state.db.pool)
+    .await;
+
+    let (thumbnail_path, status) = match cover_result {
+        Ok(row) => row,
+        Err(_) => {
+            return build_error_response(
+                StatusCode::NOT_FOUND,
+                "Cover image not found",
+                &headers,
+                &state.config.frontend_url,
+            );
+        }
+    };
+
+    // Check if still processing or no thumbnail yet
+    if status != "active" || thumbnail_path.is_none() {
+        return build_error_response(
+            StatusCode::NOT_FOUND,
+            "Cover image still processing",
+            &headers,
+            &state.config.frontend_url,
+        );
+    }
+
+    // Access control based on visibility
+    if visibility == "private" {
+        let auth_user = extract_optional_auth(&cookies, &headers, &state.config.jwt_secret);
+        match auth_user {
+            Some(user) => {
+                if user_id != user.id && !user.is_superuser() {
+                    return build_error_response(
+                        StatusCode::FORBIDDEN,
+                        "You can only access your own private cover images",
+                        &headers,
+                        &state.config.frontend_url,
+                    );
+                }
+            }
+            None => {
+                return build_error_response(
+                    StatusCode::UNAUTHORIZED,
+                    "This cover image is private. Authentication required.",
+                    &headers,
+                    &state.config.frontend_url,
+                );
+            }
+        }
+    }
+
+    let thumb_path = thumbnail_path.unwrap_or_default();
     match read_file(&state.config.storage_dir, &thumb_path).await {
         Ok(data) => Response::builder()
             .status(StatusCode::OK)
@@ -1432,8 +1851,8 @@ async fn get_audio_thumbnail(
         Err(_) => build_error_response(
             StatusCode::NOT_FOUND,
             "Thumbnail file not found on disk",
-            &HeaderMap::new(),
-            "http://localhost:5173",
+            &headers,
+            &state.config.frontend_url,
         ),
     }
 }
@@ -1470,8 +1889,8 @@ async fn set_primary_audio_thumbnail(
         );
     }
 
-    // Verify thumbnail belongs to this audio
-    let thumbnail: Result<(String,), _> = sqlx::query_as(
+    // Verify thumbnail belongs to this audio and get its thumbnail_path and status
+    let thumbnail: Result<(Option<String>,), _> = sqlx::query_as(
         "SELECT thumbnail_path FROM audio_thumbnails WHERE id = ? AND audio_id = ?"
     )
     .bind(thumbnail_id)
@@ -1530,19 +1949,24 @@ async fn set_primary_audio_thumbnail(
         );
     }
 
-    // Update audio.thumbnail_path to point to this thumbnail
-    if let Err(e) = sqlx::query("UPDATE audio SET thumbnail_path = ? WHERE id = ?")
-        .bind(&thumbnail_path)
-        .bind(id)
-        .execute(&mut *tx)
-        .await
-    {
-        let _ = tx.rollback().await;
-        tracing::error!("Failed to update audio thumbnail_path: {}", e);
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiResponse::error("Failed to update primary thumbnail")),
-        );
+    // Update audio.thumbnail_path to point to this thumbnail ONLY if it's been processed (thumbnail_path is not NULL)
+    // Skip mirroring if still processing (thumbnail_path = NULL) to avoid writing NULL over a working thumbnail
+    if let Some(path) = thumbnail_path {
+        if let Err(e) = sqlx::query("UPDATE audio SET thumbnail_path = ? WHERE id = ?")
+            .bind(&path)
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+        {
+            let _ = tx.rollback().await;
+            tracing::error!("Failed to update audio thumbnail_path: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::error("Failed to update primary thumbnail")),
+            );
+        }
+    } else {
+        tracing::debug!("Skipping audio.thumbnail_path mirror: cover is still processing (thumbnail_path = NULL)");
     }
 
     if let Err(e) = tx.commit().await {
@@ -1591,16 +2015,16 @@ async fn delete_audio_thumbnail(
         );
     }
 
-    // Fetch thumbnail to get path and is_primary status
-    let thumbnail: Result<(String, bool), _> = sqlx::query_as(
-        "SELECT thumbnail_path, is_primary FROM audio_thumbnails WHERE id = ? AND audio_id = ?"
+    // Fetch thumbnail to get paths and is_primary status
+    let thumbnail: Result<(Option<String>, Option<String>, Option<String>, bool), _> = sqlx::query_as(
+        "SELECT raw_path, thumbnail_path, preview_path, is_primary FROM audio_thumbnails WHERE id = ? AND audio_id = ?"
     )
     .bind(thumbnail_id)
     .bind(id)
     .fetch_one(&state.db.pool)
     .await;
 
-    let (thumbnail_path, is_primary) = match thumbnail {
+    let (raw_path, thumbnail_path, preview_path, is_primary) = match thumbnail {
         Ok(t) => t,
         Err(_) => {
             return (
@@ -1618,14 +2042,26 @@ async fn delete_audio_thumbnail(
 
     match result {
         Ok(_) => {
-            // Delete file from disk
-            if let Err(e) = delete_file(&state.config.storage_dir, &thumbnail_path).await {
-                tracing::warn!("Failed to delete thumbnail file from disk: {}", e);
+            // Delete files from disk (raw, thumbnail, preview)
+            if let Some(path) = raw_path {
+                if let Err(e) = delete_file(&state.config.storage_dir, &path).await {
+                    tracing::warn!("Failed to delete raw cover file from disk: {}", e);
+                }
+            }
+            if let Some(path) = &thumbnail_path {
+                if let Err(e) = delete_file(&state.config.storage_dir, path).await {
+                    tracing::warn!("Failed to delete thumbnail file from disk: {}", e);
+                }
+            }
+            if let Some(path) = preview_path {
+                if let Err(e) = delete_file(&state.config.storage_dir, &path).await {
+                    tracing::warn!("Failed to delete preview file from disk: {}", e);
+                }
             }
 
             // If this was the primary thumbnail, find the next one and set it as primary
             if is_primary {
-                let next_thumbnail: Result<Option<(i32, String)>, _> = sqlx::query_as(
+                let next_thumbnail: Result<Option<(i32, Option<String>)>, _> = sqlx::query_as(
                     "SELECT id, thumbnail_path FROM audio_thumbnails WHERE audio_id = ? ORDER BY sort_order ASC LIMIT 1"
                 )
                 .bind(id)
@@ -1637,11 +2073,13 @@ async fn delete_audio_thumbnail(
                         .bind(next_id)
                         .execute(&state.db.pool)
                         .await;
-                    let _ = sqlx::query("UPDATE audio SET thumbnail_path = ? WHERE id = ?")
-                        .bind(&next_path)
-                        .bind(id)
-                        .execute(&state.db.pool)
-                        .await;
+                    if let Some(path) = next_path {
+                        let _ = sqlx::query("UPDATE audio SET thumbnail_path = ? WHERE id = ?")
+                            .bind(&path)
+                            .bind(id)
+                            .execute(&state.db.pool)
+                            .await;
+                    }
                 } else {
                     // No more thumbnails, clear audio.thumbnail_path
                     let _ = sqlx::query("UPDATE audio SET thumbnail_path = NULL WHERE id = ?")
