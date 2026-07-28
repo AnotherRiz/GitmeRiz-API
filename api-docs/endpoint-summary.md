@@ -50,9 +50,7 @@
 | POST | `/audio` | Yes | Upload audio (multipart, no size limit); supports title/description/visibility/thumbnail (all optional except file); `.aac` auto-remuxed to `.m4a` |
 | GET | `/audio/{id}` | Optional | Get audio metadata by id (public: no auth, private: cookie/header) |
 | GET | `/audio/d/{id}` | Optional | Download audio file with attachment header by numeric id (public: no auth, private: cookie/header) |
-| GET | `/audio/t/{short_id}` | Optional | Serve primary cover art thumbnail by short_id inline, WebP cached 1 year (public: no auth, private: cookie/header) |
-| GET | `/audio/cover/{short_id_cover}` | Optional | Serve raw cover image by short_id inline, original mime type (public: no auth, private: cookie/header) |
-| GET | `/audio/cover/t/{short_id_cover}` | Optional | Serve cover thumbnail by short_id (WebP, max 500px, quality 80, cached 1 year) (public: no auth, private: cookie/header) |
+| GET | `/audio/cover/t/{short_id_cover}` | Optional | Serve cover thumbnail by short_id (WebP, max 500px, quality 80, cached 1 year); supports `?primary=true` to serve primary cover by audio short_id (public: no auth, private: cookie/header) |
 | GET | `/audio/cover/p/{short_id_cover}` | Optional | Serve cover preview by short_id (WebP, max 1280px, quality 85, cached 1 hour) (public: no auth, private: cookie/header) |
 | GET | `/audio/{short_id_audio}/cover/{short_id_cover}` | Optional | Serve specific cover thumbnail scoped to audio by short_ids (WebP, cached 1 year) (public: no auth, private: cookie/header) |
 | PATCH | `/audio/{id}` | Yes | Unified partial update: title/description/visibility/pinned (owner / superuser, max 8 pinned per user) |
